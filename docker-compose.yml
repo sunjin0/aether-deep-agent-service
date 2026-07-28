@@ -1,0 +1,35 @@
+services:
+  deep-agent:
+    build:
+      context: .
+    container_name: 127.0.0.1
+    restart: unless-stopped
+    environment:
+      AETHER_DEEP_AGENT_SHARED_SECRET: ${AETHER_DEEP_AGENT_SHARED_SECRET:-aether-deep-agent-dev-secret-change-me}
+      AETHER_DEEP_AGENT_CALLBACK_BASE_URL: ${AETHER_DEEP_AGENT_CALLBACK_BASE_URL:-http://aether-admin:8080}
+      AETHER_DEEP_AGENT_MCP_URL: ${AETHER_DEEP_AGENT_MCP_URL:-http://aether-mcp:8000/mcp}
+      AETHER_DEEP_AGENT_MODEL: ${AETHER_DEEP_AGENT_MODEL:-openai:gpt-4.1-mini}
+      AETHER_DEEP_AGENT_DATABASE_URL: ${AETHER_DEEP_AGENT_DATABASE_URL:-sqlite+aiosqlite:////data/aether_deep_agent.db}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+    volumes:
+      - deep-agent-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      aether-services:
+        aliases:
+          - aether-deep-agent
+
+networks:
+  aether-services:
+    external: true
+    name: ${AETHER_SHARED_NETWORK:-aether-mcp-server_default}
+
+volumes:
+  deep-agent-data:
