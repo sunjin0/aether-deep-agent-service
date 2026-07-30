@@ -2,8 +2,10 @@ services:
   deep-agent:
     build:
       context: .
-    container_name: 127.0.0.1
+    container_name: aether-deep-agent
     restart: unless-stopped
+    ports:
+      - "${AETHER_DEEP_AGENT_PORT:-8010}:8010"
     environment:
       AETHER_DEEP_AGENT_SHARED_SECRET: ${AETHER_DEEP_AGENT_SHARED_SECRET:-aether-deep-agent-dev-secret-change-me}
       AETHER_DEEP_AGENT_CALLBACK_BASE_URL: ${AETHER_DEEP_AGENT_CALLBACK_BASE_URL:-http://aether-admin:8080}

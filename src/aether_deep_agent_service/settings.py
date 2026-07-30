@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +18,8 @@ class Settings(BaseSettings):
     max_steps: int = 12
     run_timeout_seconds: int = 600
     callback_timeout_seconds: float = 10.0
+    callback_max_retries: int = Field(default=3, ge=0)
+    callback_retry_backoff_seconds: float = Field(default=1.0, ge=0)
 
 
 @lru_cache

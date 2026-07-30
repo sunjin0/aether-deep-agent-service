@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -9,6 +10,13 @@ from .schemas import DeepRunRequest, DeepRunResponse, RunStatus
 from .security import verify_request_signature
 from .settings import Settings, get_settings
 from .store import RunStore
+
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_run_timeout(payload: DeepRunRequest, settings: Settings) -> int:
+    return payload.timeout_seconds if payload.timeout_seconds is not None else settings.run_timeout_seconds
 
 
 def build_application(settings: Settings | None = None) -> FastAPI:
@@ -30,16 +38,24 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     async def authenticated(request: Request) -> None:
         await verify_request_signature(request, resolved_settings)
 
+    async def safe_callback(run_id: str, event_type: str, data: dict) -> None:
+        try:
+            await callbacks.send(run_id, event_type, data)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to deliver callback %s for run %s", event_type, run_id)
+
     async def run(request: DeepRunRequest) -> None:
         await store.update(request.run_id, RunStatus.RUNNING)
-        await callbacks.send(request.run_id, "run.started", {"status": RunStatus.RUNNING})
         try:
-            await callbacks.send(request.run_id, "plan.updated", {
+            await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
+            await safe_callback(request.run_id, "plan.updated", {
                 "summary": "Starting read-only knowledge analysis", "maxSteps": request.max_steps,
             })
-            result = await executor.execute(request, lambda event_type, data: callbacks.send(request.run_id, event_type, data))
+            result = await executor.execute(request, lambda event_type, data: safe_callback(request.run_id, event_type, data))
             await store.update(request.run_id, RunStatus.SUCCEEDED, result=result.content)
-            await callbacks.send(request.run_id, "run.completed", {
+            await safe_callback(request.run_id, "run.completed", {
                 "content": result.content, "citations": result.citations,
                 "model": result.model, "tools": result.tools,
                 "promptTokens": result.prompt_tokens, "completionTokens": result.completion_tokens,
@@ -47,12 +63,13 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             })
         except asyncio.CancelledError:
             await store.update(request.run_id, RunStatus.CANCELLED)
-            await callbacks.send(request.run_id, "run.cancelled", {})
+            await safe_callback(request.run_id, "run.cancelled", {})
             raise
         except Exception as error:
             message = str(error)
+            logger.exception("Deep run %s failed", request.run_id)
             await store.update(request.run_id, RunStatus.FAILED, error=message)
-            await callbacks.send(request.run_id, "run.failed", {"error": message})
+            await safe_callback(request.run_id, "run.failed", {"error": message})
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -61,6 +78,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/runs", response_model=DeepRunResponse, status_code=status.HTTP_202_ACCEPTED,
               dependencies=[Depends(authenticated)])
     async def create_run(payload: DeepRunRequest) -> DeepRunResponse:
+        payload.timeout_seconds = resolve_run_timeout(payload, resolved_settings)
         record, created = await store.create_if_absent(payload)
         if created:
             tasks[payload.run_id] = asyncio.create_task(run(payload))

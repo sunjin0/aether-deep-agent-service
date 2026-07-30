@@ -29,7 +29,7 @@ class DeepRunRequest(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     delegation_token: str = Field(min_length=1)
     max_steps: int = Field(default=12, ge=1, le=50)
-    timeout_seconds: int = Field(default=600, ge=30, le=3600)
+    timeout_seconds: int | None = Field(default=None, ge=30, le=3600)
 
 
 class DeepRunResponse(BaseModel):

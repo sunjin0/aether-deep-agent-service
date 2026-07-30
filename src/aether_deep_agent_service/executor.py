@@ -54,8 +54,12 @@ class DeepAgentExecutor:
         if not self.settings.model:
             raise RuntimeError("AETHER_DEEP_AGENT_MODEL is not configured")
 
+        # Java 模型供应商使用 OpenAI 兼容端点时通常只保存模型名（如 deepseek-v4-flash）。
+        # 显式补充 provider，避免 LangChain 将其误判为需要额外 SDK 的原生 DeepSeek 模型。
+        model = self.settings.model if ":" in self.settings.model else "openai:" + self.settings.model
+
         register_harness_profile(
-            self.settings.model,
+            model,
             HarnessProfile(excluded_tools=frozenset({
                 "ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute",
             })),
@@ -71,7 +75,7 @@ class DeepAgentExecutor:
         tools = await self._load_mcp_tools(request)
         await emit("step.started", {"message": "Preparing delegated MCP tools", "toolCount": len(tools)})
         telemetry = RunTelemetryHandler(emit)
-        agent = create_deep_agent(model=self.settings.model, tools=tools, system_prompt=instructions)
+        agent = create_deep_agent(model=model, tools=tools, system_prompt=instructions)
         state = await asyncio.wait_for(agent.ainvoke({"messages": [{"role": "user", "content": (
             f"Task:\n{request.task}\n\nEvidence:\n{source_context}"
         )}]}, config={"recursion_limit": request.max_steps * 4, "callbacks": [telemetry]}), timeout=request.timeout_seconds)
@@ -85,7 +89,7 @@ class DeepAgentExecutor:
         return ExecutionResult(
             content=content,
             citations=citations,
-            model=self.settings.model,
+            model=model,
             tools=list(dict.fromkeys(telemetry.tools)),
             prompt_tokens=telemetry.prompt_tokens,
             completion_tokens=telemetry.completion_tokens,
