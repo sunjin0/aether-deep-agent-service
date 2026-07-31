@@ -38,6 +38,10 @@ class DeepRunResponse(BaseModel):
     created: bool
 
 
+class ResumeRunRequest(BaseModel):
+    decisions: list[dict[str, Any]] = Field(min_length=1, max_length=20)
+
+
 class CallbackEvent(BaseModel):
     event_id: str
     event_type: str

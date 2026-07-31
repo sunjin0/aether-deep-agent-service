@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 
 from .callbacks import CallbackClient
-from .executor import DeepAgentExecutor
-from .schemas import DeepRunRequest, DeepRunResponse, RunStatus
+from .executor import DeepAgentExecutor, ExecutionResult, PendingApproval
+from .schemas import DeepRunRequest, DeepRunResponse, ResumeRunRequest, RunStatus
 from .security import verify_request_signature
 from .settings import Settings, get_settings
 from .store import RunStore
@@ -25,6 +25,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     callbacks = CallbackClient(resolved_settings)
     executor = DeepAgentExecutor(resolved_settings)
     tasks: dict[str, asyncio.Task] = {}
+    pending_approvals: dict[str, PendingApproval] = {}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -46,21 +47,34 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         except Exception:
             logger.exception("Failed to deliver callback %s for run %s", event_type, run_id)
 
-    async def run(request: DeepRunRequest) -> None:
-        await store.update(request.run_id, RunStatus.RUNNING)
+    async def finish_execution(request: DeepRunRequest, result: ExecutionResult | PendingApproval) -> None:
+        if isinstance(result, PendingApproval):
+            pending_approvals[request.run_id] = result
+            await safe_callback(request.run_id, "tool.approval.required", {"actions": result.actions})
+            return
+        pending_approvals.pop(request.run_id, None)
+        await store.update(request.run_id, RunStatus.SUCCEEDED, result=result.content)
+        await safe_callback(request.run_id, "run.completed", {
+            "content": result.content, "citations": result.citations,
+            "model": result.model, "tools": result.tools,
+            "promptTokens": result.prompt_tokens, "completionTokens": result.completion_tokens,
+            "totalTokens": ((result.prompt_tokens or 0) + (result.completion_tokens or 0)) or None,
+        })
+
+    async def run(request: DeepRunRequest, pending: PendingApproval | None = None,
+                  decisions: list[dict] | None = None) -> None:
+        if pending is None:
+            await store.update(request.run_id, RunStatus.RUNNING)
         try:
-            await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
-            await safe_callback(request.run_id, "plan.updated", {
-                "summary": "Starting read-only knowledge analysis", "maxSteps": request.max_steps,
-            })
-            result = await executor.execute(request, lambda event_type, data: safe_callback(request.run_id, event_type, data))
-            await store.update(request.run_id, RunStatus.SUCCEEDED, result=result.content)
-            await safe_callback(request.run_id, "run.completed", {
-                "content": result.content, "citations": result.citations,
-                "model": result.model, "tools": result.tools,
-                "promptTokens": result.prompt_tokens, "completionTokens": result.completion_tokens,
-                "totalTokens": ((result.prompt_tokens or 0) + (result.completion_tokens or 0)) or None,
-            })
+            if pending is None:
+                await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
+                await safe_callback(request.run_id, "plan.updated", {
+                    "summary": "Starting read-only knowledge analysis", "maxSteps": request.max_steps,
+                })
+                result = await executor.execute(request, lambda event_type, data: safe_callback(request.run_id, event_type, data))
+            else:
+                result = await executor.resume(pending, decisions or [])
+            await finish_execution(request, result)
         except asyncio.CancelledError:
             await store.update(request.run_id, RunStatus.CANCELLED)
             await safe_callback(request.run_id, "run.cancelled", {})
@@ -96,6 +110,18 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         elif record.status not in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}:
             await store.update(run_id, RunStatus.CANCELLED)
         return {"runId": run_id, "status": "CANCELLED"}
+
+    @app.post("/v1/runs/{run_id}/resume", status_code=status.HTTP_202_ACCEPTED,
+              dependencies=[Depends(authenticated)])
+    async def resume_run(run_id: str, payload: ResumeRunRequest) -> dict[str, str]:
+        record = await store.get(run_id)
+        pending = pending_approvals.pop(run_id, None)
+        if record is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        if pending is None:
+            raise HTTPException(status_code=409, detail="run is not waiting for tool approval")
+        tasks[run_id] = asyncio.create_task(run(pending.request, pending, payload.decisions))
+        return {"runId": run_id, "status": "RUNNING"}
 
     return app
 
