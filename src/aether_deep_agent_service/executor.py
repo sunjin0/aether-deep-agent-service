@@ -1,4 +1,6 @@
 import asyncio
+import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -8,6 +10,7 @@ from deepagents import HarnessProfile, create_deep_agent, register_harness_profi
 from langchain.chat_models import init_chat_model
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import LLMResult
+from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
@@ -17,6 +20,12 @@ from .settings import Settings
 
 
 EventSink = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+@tool
+def ask_user(questions: list[dict[str, Any]], question: str = "") -> str:
+    """Ask the user 1-4 structured choice or confirm questions when required to continue."""
+    return "User answers will be provided before this tool continues."
 
 
 class RunTelemetryHandler(AsyncCallbackHandler):
@@ -62,10 +71,60 @@ class RunTelemetryHandler(AsyncCallbackHandler):
         if isinstance(completion, int):
             self.completion_tokens = (self.completion_tokens or 0) + completion
 
+    async def on_llm_new_token(self, token: str, **_: Any) -> None:
+        if token:
+            await self.emit("message.delta", {"chunk": token})
+
 
 class DeepAgentExecutor:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+
+    async def plan(self, request: DeepRunRequest) -> list[dict[str, str]]:
+        """Use the configured model to turn the user's request into an executable task plan."""
+        if not self.settings.model:
+            return self._fallback_plan(request.task)
+        model = self.settings.model if ":" in self.settings.model else "openai:" + self.settings.model
+        prompt = (
+            "Create a concise execution plan for the user's task. Return JSON only in this exact shape: "
+            '{"tasks":[{"title":"..."}]}. Generate 3 to 6 concrete, ordered steps. '
+            "Each title must describe work needed for this specific task; do not use generic workflow phases. "
+            "Do not answer the task itself and do not mention unavailable tools.\n\n"
+            f"User task:\n{request.task}"
+        )
+        try:
+            planner = init_chat_model(model, use_responses_api=False)
+            response = await asyncio.wait_for(
+                planner.ainvoke([{"role": "user", "content": prompt}]),
+                timeout=min(request.timeout_seconds or self.settings.run_timeout_seconds, 60),
+            )
+            return self._parse_plan(getattr(response, "content", ""), request.task)
+        except Exception:
+            # The run can still proceed when a model provider does not support a separate planning call.
+            return self._fallback_plan(request.task)
+
+    @staticmethod
+    def _parse_plan(content: Any, task: str) -> list[dict[str, str]]:
+        if not isinstance(content, str):
+            return DeepAgentExecutor._fallback_plan(task)
+        normalized = content.strip()
+        if normalized.startswith("```"):
+            normalized = normalized.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            raw_tasks = json.loads(normalized).get("tasks", [])
+        except (json.JSONDecodeError, AttributeError):
+            return DeepAgentExecutor._fallback_plan(task)
+        tasks: list[dict[str, str]] = []
+        for item in raw_tasks[:6]:
+            title = item.get("title") if isinstance(item, dict) else None
+            if isinstance(title, str) and title.strip():
+                tasks.append({"id": f"task-{len(tasks) + 1}", "title": title.strip(), "status": "pending"})
+        return tasks if len(tasks) >= 2 else DeepAgentExecutor._fallback_plan(task)
+
+    @staticmethod
+    def _fallback_plan(task: str) -> list[dict[str, str]]:
+        title = task.strip().replace("\n", " ")[:80] or "完成当前任务"
+        return [{"id": "task-1", "title": title, "status": "pending"}]
 
     async def execute(self, request: DeepRunRequest, emit: EventSink) -> "ExecutionResult | PendingApproval":
         if not self.settings.model:
@@ -82,19 +141,22 @@ class DeepAgentExecutor:
             })),
         )
         source_context = "\n\n".join(
-            f"[{source.citation}] {source.title}\n{source.content}" for source in request.knowledge_sources
+            f"[{source.citation}] {source.documentName or source.title}\n{source.content}" for source in request.knowledge_sources
         )
         instructions = (
             f"{request.system_prompt}\n\n"
             "You are a read-only knowledge analysis agent. Use only the supplied evidence. "
-            "Do not claim to have used a source that is not in the evidence. Cite evidence using its bracketed citation."
+            "Do not claim to have used a source that is not in the evidence. Cite evidence using its bracketed citation. "
+            "When a required goal, constraint, preference, or decision is missing, call ask_user instead of guessing. "
+            "Use 1-4 structured choice or confirm questions and continue only after the user answers."
         )
         tools = await self._load_mcp_tools(request)
+        tools.append(ask_user)
         await emit("step.started", {"message": "Preparing delegated MCP tools", "toolCount": len(tools)})
         telemetry = RunTelemetryHandler(emit)
         # DeepSeek 的 OpenAI 兼容端点支持 Chat Completions，不提供 Responses API。
         # 预初始化模型以明确关闭 Responses API，避免客户端请求 /responses 返回 404。
-        chat_model = init_chat_model(model, use_responses_api=False)
+        chat_model = init_chat_model(model, use_responses_api=False, streaming=True)
         # 所有委托 MCP 工具均须在实际执行前中断，避免 Deep 模式绕过平台审批。
         agent = create_deep_agent(
             model=chat_model,
@@ -139,6 +201,9 @@ class DeepAgentExecutor:
         content = getattr(messages[-1], "content", "")
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("Deep Agent returned an empty final message")
+        # 模型偶尔会把要求的全角引用【1】输出为半角[1]。在持久化前统一格式，
+        # 以保证 Java 的引用审计和 Dashboard 的来源锚点使用同一个编号。
+        content = self._normalize_citation_format(content)
         citations = [source.model_dump() for source in request.knowledge_sources if source.citation in content]
         return ExecutionResult(
             content=content,
@@ -148,6 +213,10 @@ class DeepAgentExecutor:
             prompt_tokens=telemetry.prompt_tokens,
             completion_tokens=telemetry.completion_tokens,
         )
+
+    @staticmethod
+    def _normalize_citation_format(content: str) -> str:
+        return re.sub(r"(?<!【)\[(\d+)\]", r"【\1】", content)
 
     async def _load_mcp_tools(self, request: DeepRunRequest) -> list:
         if not request.allowed_tools:
@@ -185,3 +254,9 @@ class PendingApproval:
     actions: list[dict[str, Any]]
     timeout_seconds: int
     model: str
+
+
+@dataclass
+class PendingUserQuestion:
+    request: DeepRunRequest
+    actions: list[dict[str, Any]]

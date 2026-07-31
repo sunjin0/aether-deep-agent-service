@@ -107,6 +107,53 @@ def test_run_started_callback_failure_does_not_prevent_successful_execution(monk
     assert stores[0].updates[-1] == ("run-started-failure", "SUCCEEDED", "Result", None)
 
 
+def test_run_emits_task_plan_updates(monkeypatch) -> None:
+    settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+    execute = AsyncMock(return_value=ExecutionResult(
+        content="Result", citations=[], model="test-model", tools=[], prompt_tokens=None, completion_tokens=None,
+    ))
+    send = AsyncMock()
+
+    class FakeStore:
+        def __init__(self, _database_url) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            pass
+
+        async def create_if_absent(self, request):
+            return type("Record", (), {"run_id": request.run_id, "status": "QUEUED"})(), True
+
+        async def update(self, _run_id, _status, result=None, error=None) -> None:
+            pass
+
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", execute)
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
+    monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
+
+    app = build_application(settings)
+    payload = {
+        "run_id": "task-plan", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "task": "Summarize evidence.", "delegation_token": "token",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    with TestClient(app) as client:
+        response = client.post("/v1/runs", content=body, headers={
+            "X-Aether-Key-Id": settings.key_id,
+            "X-Aether-Timestamp": timestamp,
+            "X-Aether-Signature": build_signature(settings.shared_secret, timestamp, body),
+            "Content-Type": "application/json",
+        })
+        assert response.status_code == 202
+        client.portal.call(asyncio.sleep, 0.05)
+
+    plans = [call.args[2] for call in send.await_args_list if call.args[1] == "plan.updated"]
+    assert len(plans) == 2
+    assert plans[0]["tasks"][0]["status"] == "running"
+    assert plans[-1]["tasks"][-1]["status"] == "completed"
+
+
 def test_run_completed_callback_failure_does_not_change_successful_status(monkeypatch) -> None:
     settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
     execute = AsyncMock(return_value=ExecutionResult(

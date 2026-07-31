@@ -26,3 +26,24 @@ async def test_load_mcp_tools_filters_to_java_allowed_tools(monkeypatch) -> None
 
     assert [tool.name for tool in tools] == ["get_current_time"]
     assert captured["config"]["aether"]["headers"]["Authorization"] == "Bearer java-issued-token"
+
+
+def test_parse_plan_keeps_task_specific_titles() -> None:
+    tasks = DeepAgentExecutor._parse_plan(
+        '{"tasks":[{"title":"提取合同中的付款与违约条款"}, {"title":"识别高风险条款并说明影响"}, {"title":"形成带优先级的修改建议"}]}',
+        "审查合同风险",
+    )
+
+    assert [task["title"] for task in tasks] == [
+        "提取合同中的付款与违约条款",
+        "识别高风险条款并说明影响",
+        "形成带优先级的修改建议",
+    ]
+
+
+def test_normalize_citation_format_supports_half_width_model_output() -> None:
+    content = "依据：[4]，并保留【5】和 Markdown [链接](https://example.test)。"
+
+    assert DeepAgentExecutor._normalize_citation_format(content) == (
+        "依据：【4】，并保留【5】和 Markdown [链接](https://example.test)。"
+    )

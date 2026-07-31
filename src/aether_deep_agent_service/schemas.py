@@ -16,6 +16,11 @@ class KnowledgeSource(BaseModel):
     title: str
     content: str
     citation: str
+    citationIndex: int
+    documentName: str | None = None
+    documentId: str | None = None
+    chunkId: str | None = None
+    sectionPath: str | None = None
 
 
 class DeepRunRequest(BaseModel):
@@ -39,7 +44,8 @@ class DeepRunResponse(BaseModel):
 
 
 class ResumeRunRequest(BaseModel):
-    decisions: list[dict[str, Any]] = Field(min_length=1, max_length=20)
+    decisions: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    answers: dict[str, Any] = Field(default_factory=dict)
 
 
 class CallbackEvent(BaseModel):
