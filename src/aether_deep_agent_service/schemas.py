@@ -21,6 +21,8 @@ class KnowledgeSource(BaseModel):
     documentId: str | None = None
     chunkId: str | None = None
     sectionPath: str | None = None
+    similarity: float | None = None
+    retrievalScore: float | None = None
 
 
 class DeepRunRequest(BaseModel):
