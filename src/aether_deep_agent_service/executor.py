@@ -157,12 +157,15 @@ class DeepAgentExecutor:
         # DeepSeek 的 OpenAI 兼容端点支持 Chat Completions，不提供 Responses API。
         # 预初始化模型以明确关闭 Responses API，避免客户端请求 /responses 返回 404。
         chat_model = init_chat_model(model, use_responses_api=False, streaming=True)
-        # 所有委托 MCP 工具均须在实际执行前中断，避免 Deep 模式绕过平台审批。
+        # `never` is an explicit run-scoped grant issued by Java. Other policies
+        # interrupt here; Java evaluates per-action risk and auto-resumes a
+        # low-risk `risky` batch without exposing a confirmation card.
+        interrupt_on = self._build_interrupt_on(tools, request.tool_approval_policy)
         agent = create_deep_agent(
             model=chat_model,
             tools=tools,
             system_prompt=instructions,
-            interrupt_on={tool.name: {"allowed_decisions": ["approve", "reject"]} for tool in tools},
+            interrupt_on=interrupt_on,
             checkpointer=InMemorySaver(),
         )
         # 一次 MCP 工具调用至少包含模型决策、工具调用和结果归纳三个图节点。
@@ -184,6 +187,14 @@ class DeepAgentExecutor:
             timeout=pending.timeout_seconds,
         )
         return self._result_or_pending(state, pending.request, pending.agent, pending.config, pending.telemetry, pending.model)
+
+    @staticmethod
+    def _build_interrupt_on(tools: list, approval_policy: str) -> dict[str, dict[str, list[str]]]:
+        decision_config = {"allowed_decisions": ["approve", "reject"]}
+        interrupts = {ask_user.name: decision_config}
+        if approval_policy != "never":
+            interrupts.update({tool.name: decision_config for tool in tools})
+        return interrupts
 
     def _result_or_pending(self, state: dict[str, Any], request: DeepRunRequest,
                            agent: Any, config: dict[str, Any], telemetry: RunTelemetryHandler,

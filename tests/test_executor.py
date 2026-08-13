@@ -41,6 +41,23 @@ def test_parse_plan_keeps_task_specific_titles() -> None:
     ]
 
 
+def test_deep_run_request_accepts_only_known_tool_approval_policies() -> None:
+    request = DeepRunRequest(
+        run_id="run-1", user_id="user-1", agent_id="agent-1", conversation_id="conversation-1",
+        task="Read the report", delegation_token="java-issued-token", tool_approval_policy="never",
+    )
+
+    assert request.tool_approval_policy == "never"
+
+
+def test_never_policy_skips_mcp_interrupts_but_keeps_ask_user_interrupt() -> None:
+    tools = [SimpleNamespace(name="read_document"), SimpleNamespace(name="ask_user")]
+
+    interrupts = DeepAgentExecutor._build_interrupt_on(tools, "never")
+
+    assert interrupts == {"ask_user": {"allowed_decisions": ["approve", "reject"]}}
+
+
 def test_normalize_citation_format_supports_half_width_model_output() -> None:
     content = "依据：[4]，并保留【5】和 Markdown [链接](https://example.test)。"
 

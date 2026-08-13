@@ -35,6 +35,7 @@ class DeepRunRequest(BaseModel):
     knowledge_sources: list[KnowledgeSource] = Field(default_factory=list)
     allowed_tools: list[str] = Field(default_factory=list)
     delegation_token: str = Field(min_length=1)
+    tool_approval_policy: str = Field(default="ask", pattern="^(ask|risky|never)$")
     max_steps: int = Field(default=12, ge=1, le=50)
     timeout_seconds: int | None = Field(default=None, ge=30, le=3600)
 
