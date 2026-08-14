@@ -20,7 +20,10 @@ class CallbackClient:
             event_id=str(uuid.uuid4()), event_type=event_type, run_id=run_id,
             occurred_at=int(time.time() * 1000), data=data,
         )
-        await self._send_with_retry(run_id, event)
+        await self.send_event(event)
+
+    async def send_event(self, event: CallbackEvent) -> None:
+        await self._send_with_retry(event.run_id, event)
 
     async def _send_with_retry(self, run_id: str, event: CallbackEvent) -> None:
         body = event.model_dump_json().encode("utf-8")

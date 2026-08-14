@@ -10,6 +10,7 @@ class RunStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    PAUSED = "PAUSED"
 
 
 class KnowledgeSource(BaseModel):
@@ -49,6 +50,13 @@ class DeepRunResponse(BaseModel):
 class ResumeRunRequest(BaseModel):
     decisions: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     answers: dict[str, Any] = Field(default_factory=dict)
+
+
+class DeepRunStatusResponse(BaseModel):
+    run_id: str
+    status: RunStatus
+    checkpoint_no: int = 0
+    updated_at: int
 
 
 class CallbackEvent(BaseModel):

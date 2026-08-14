@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
-from aether_deep_agent_service.app import build_application, resolve_run_timeout
+from aether_deep_agent_service.app import (
+    build_application,
+    build_ask_user_response_decisions,
+    normalize_ask_user_payload,
+    resolve_run_timeout,
+)
 from aether_deep_agent_service.executor import ExecutionResult
 from aether_deep_agent_service.schemas import DeepRunRequest
 from aether_deep_agent_service.security import build_signature
@@ -57,6 +62,24 @@ def test_submission_preserves_explicit_timeout_over_configured_default() -> None
     )
 
     assert resolve_run_timeout(request, Settings(run_timeout_seconds=321)) == 123
+
+
+def test_ask_user_normalizes_missing_options_to_choice_with_custom_input() -> None:
+    payload = normalize_ask_user_payload({
+        "questions": [{"id": "target", "question": "请提供目标文档或用户 ID"}],
+    })
+
+    question = payload["questions"][0]
+    assert question["type"] == "choice"
+    assert question["allowCustomInput"] is True
+    assert len(question["options"]) == 2
+
+
+def test_ask_user_answer_is_sent_as_human_response() -> None:
+    decisions = build_ask_user_response_decisions({"target": {"selected": "用户 123"}})
+
+    assert decisions[0]["type"] == "respond"
+    assert '"用户 123"' in decisions[0]["message"]
 
 
 def test_run_started_callback_failure_does_not_prevent_successful_execution(monkeypatch) -> None:

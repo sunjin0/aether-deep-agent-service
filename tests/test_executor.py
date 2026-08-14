@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from aether_deep_agent_service.executor import DeepAgentExecutor
+from aether_deep_agent_service.executor import DeepAgentExecutor, ask_user
 from aether_deep_agent_service.schemas import DeepRunRequest
 from aether_deep_agent_service.settings import Settings
 
@@ -55,7 +55,26 @@ def test_never_policy_skips_mcp_interrupts_but_keeps_ask_user_interrupt() -> Non
 
     interrupts = DeepAgentExecutor._build_interrupt_on(tools, "never")
 
-    assert interrupts == {"ask_user": {"allowed_decisions": ["approve", "reject"]}}
+    assert interrupts == {"ask_user": {"allowed_decisions": ["respond"]}}
+
+
+def test_ask_user_uses_human_response_instead_of_tool_approval() -> None:
+    tools = [SimpleNamespace(name="read_document"), SimpleNamespace(name="ask_user")]
+
+    interrupts = DeepAgentExecutor._build_interrupt_on(tools, "ask")
+
+    assert interrupts["ask_user"] == {"allowed_decisions": ["respond"]}
+    assert interrupts["read_document"] == {"allowed_decisions": ["approve", "reject"]}
+
+
+def test_ask_user_schema_requires_choices_and_custom_input() -> None:
+    schema = ask_user.args_schema.model_json_schema()
+    question_schema = schema["$defs"]["AskUserQuestion"]
+
+    assert question_schema["properties"]["type"]["const"] == "choice"
+    assert question_schema["properties"]["options"]["minItems"] == 2
+    assert question_schema["properties"]["options"]["maxItems"] == 4
+    assert question_schema["properties"]["allowCustomInput"]["const"] is True
 
 
 def test_normalize_citation_format_supports_half_width_model_output() -> None:

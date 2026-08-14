@@ -3,7 +3,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
 
 from deepagents import HarnessProfile, create_deep_agent, register_harness_profile
@@ -12,8 +12,8 @@ from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import LLMResult
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from .schemas import DeepRunRequest
 from .settings import Settings
@@ -22,9 +22,58 @@ from .settings import Settings
 EventSink = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
+class AskUserOption(BaseModel):
+    """A selectable answer exposed in the chat interaction card."""
+
+    id: str = Field(description="Stable option identifier")
+    label: str = Field(description="Option text shown to the user")
+    value: str = Field(description="Value returned when the option is selected")
+
+
+class AskUserQuestion(BaseModel):
+    """Required schema for collecting missing user information.
+
+    This is intentionally distinct from tool approval. An ask_user interaction
+    always provides concrete choices and a free-text fallback; it must never be
+    modelled as a confirm/cancel decision.
+    """
+
+    id: str = Field(description="Stable question identifier")
+    type: Literal["choice"] = Field(
+        default="choice",
+        description="Must be choice; do not use confirm or yes/no",
+    )
+    question: str = Field(description="The missing information to collect")
+    options: list[AskUserOption] = Field(
+        min_length=2,
+        max_length=4,
+        description="Two to four concrete, mutually exclusive choices",
+    )
+    multiple: bool = Field(default=False, description="Whether multiple choices are permitted")
+    allowCustomInput: Literal[True] = Field(
+        default=True,
+        description="Always true so the user can provide information outside the choices",
+    )
+    customInputPlaceholder: str = Field(
+        default="请输入具体信息",
+        description="Placeholder for the free-text answer field",
+    )
+
+
 @tool
-def ask_user(questions: list[dict[str, Any]], question: str = "") -> str:
-    """Ask the user 1-4 structured choice or confirm questions when required to continue."""
+def ask_user(
+    questions: list[AskUserQuestion] = Field(
+        min_length=1,
+        max_length=4,
+        description="One to four structured choice questions",
+    ),
+    question: str = "",
+) -> str:
+    """Collect missing user information through choices plus a custom input field.
+
+    Do not use this tool for an approval decision. Every question must use type
+    ``choice``, include 2-4 concrete options, and enable custom input.
+    """
     return "User answers will be provided before this tool continues."
 
 
@@ -126,7 +175,26 @@ class DeepAgentExecutor:
         title = task.strip().replace("\n", " ")[:80] or "完成当前任务"
         return [{"id": "task-1", "title": title, "status": "pending"}]
 
-    async def execute(self, request: DeepRunRequest, emit: EventSink) -> "ExecutionResult | PendingApproval":
+    async def execute(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
+        agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
+        state = await asyncio.wait_for(agent.ainvoke({"messages": [{"role": "user", "content": (
+            f"Task:\n{request.task}\n\nEvidence:\n{self._source_context(request)}"
+        )}]}, config=config), timeout=request.timeout_seconds)
+        return self._result_or_pending(state, request, agent, config, telemetry, model)
+
+    async def continue_from_checkpoint(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
+        """Resume a paused graph from LangGraph's durable thread checkpoint."""
+        agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
+        state = await asyncio.wait_for(agent.ainvoke(None, config=config), timeout=request.timeout_seconds)
+        return self._result_or_pending(state, request, agent, config, telemetry, model)
+
+    async def resume(self, request: DeepRunRequest, decisions: list[dict[str, Any]], emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
+        """Rebuild the graph and use the durable thread state to resolve an interrupt."""
+        agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
+        state = await asyncio.wait_for(agent.ainvoke(Command(resume={"decisions": decisions}), config=config), timeout=request.timeout_seconds)
+        return self._result_or_pending(state, request, agent, config, telemetry, model)
+
+    async def _create_agent(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> tuple[Any, dict[str, Any], RunTelemetryHandler, str]:
         if not self.settings.model:
             raise RuntimeError("AETHER_DEEP_AGENT_MODEL is not configured")
 
@@ -140,15 +208,13 @@ class DeepAgentExecutor:
                 "ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute",
             })),
         )
-        source_context = "\n\n".join(
-            f"[{source.citation}] {source.documentName or source.title}\n{source.content}" for source in request.knowledge_sources
-        )
         instructions = (
             f"{request.system_prompt}\n\n"
             "You are a read-only knowledge analysis agent. Use only the supplied evidence. "
             "Do not claim to have used a source that is not in the evidence. Cite evidence using its bracketed citation. "
             "When a required goal, constraint, preference, or decision is missing, call ask_user instead of guessing. "
-            "Use 1-4 structured choice or confirm questions and continue only after the user answers."
+            "Use 1-4 structured choice questions, each with 2-4 concrete options; the user can also provide custom input. "
+            "After answers are returned, treat them as authoritative and continue without repeating the same question."
         )
         tools = await self._load_mcp_tools(request)
         tools.append(ask_user)
@@ -166,7 +232,7 @@ class DeepAgentExecutor:
             tools=tools,
             system_prompt=instructions,
             interrupt_on=interrupt_on,
-            checkpointer=InMemorySaver(),
+            checkpointer=checkpointer,
         )
         # 一次 MCP 工具调用至少包含模型决策、工具调用和结果归纳三个图节点。
         # Java 配置 max_steps=1 时，原先的 4 次递归预算不足以完成这条最短链路。
@@ -176,24 +242,19 @@ class DeepAgentExecutor:
             "callbacks": [telemetry],
             "configurable": {"thread_id": request.run_id},
         }
-        state = await asyncio.wait_for(agent.ainvoke({"messages": [{"role": "user", "content": (
-            f"Task:\n{request.task}\n\nEvidence:\n{source_context}"
-        )}]}, config=config), timeout=request.timeout_seconds)
-        return self._result_or_pending(state, request, agent, config, telemetry, model)
+        return agent, config, telemetry, model
 
-    async def resume(self, pending: "PendingApproval", decisions: list[dict[str, Any]]) -> "ExecutionResult | PendingApproval":
-        state = await asyncio.wait_for(
-            pending.agent.ainvoke(Command(resume={"decisions": decisions}), config=pending.config),
-            timeout=pending.timeout_seconds,
-        )
-        return self._result_or_pending(state, pending.request, pending.agent, pending.config, pending.telemetry, pending.model)
+    @staticmethod
+    def _source_context(request: DeepRunRequest) -> str:
+        return "\n\n".join(f"[{source.citation}] {source.documentName or source.title}\n{source.content}" for source in request.knowledge_sources)
 
     @staticmethod
     def _build_interrupt_on(tools: list, approval_policy: str) -> dict[str, dict[str, list[str]]]:
         decision_config = {"allowed_decisions": ["approve", "reject"]}
-        interrupts = {ask_user.name: decision_config}
+        # ask_user is answered by the human; it is not a binary tool approval.
+        interrupts = {ask_user.name: {"allowed_decisions": ["respond"]}}
         if approval_policy != "never":
-            interrupts.update({tool.name: decision_config for tool in tools})
+            interrupts.update({tool.name: decision_config for tool in tools if tool.name != ask_user.name})
         return interrupts
 
     def _result_or_pending(self, state: dict[str, Any], request: DeepRunRequest,

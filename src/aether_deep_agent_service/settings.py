@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     shared_secret: str = ""
     key_id: str = "deep-agent-v1"
     callback_base_url: str = ""
-    database_url: str = "sqlite+aiosqlite:///./aether_deep_agent.db"
+    database_url: str = "postgresql+asyncpg://aether:aether_dev@postgres:5432/aether"
     model: str = ""
     mcp_url: str = ""
     max_steps: int = 12

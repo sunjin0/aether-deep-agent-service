@@ -1,13 +1,17 @@
 import asyncio
 import json
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from .callbacks import CallbackClient
 from .executor import DeepAgentExecutor, ExecutionResult, PendingApproval, PendingUserQuestion
-from .schemas import DeepRunRequest, DeepRunResponse, ResumeRunRequest, RunStatus
+from .schemas import CallbackEvent, DeepRunRequest, DeepRunResponse, DeepRunStatusResponse, ResumeRunRequest, RunStatus
 from .security import verify_request_signature
 from .settings import Settings, get_settings
 from .store import RunStore
@@ -28,40 +32,68 @@ def update_task_plan(tasks: list[dict[str, str]], active_index: int | None = Non
 
 
 def normalize_ask_user_payload(payload: dict) -> dict:
-    """Normalize model-generated questions to the dashboard's interaction schema."""
+    """Normalize model-generated questions to selectable dashboard questions.
+
+    ``ask_user`` is used to collect missing business information, not to approve a
+    tool call.  It therefore always exposes choices together with a custom input
+    field.  Tool approvals remain a separate confirm interaction.
+    """
     normalized = []
     for index, raw in enumerate(payload.get("questions") or []):
         if not isinstance(raw, dict) or not str(raw.get("question") or "").strip():
             continue
         question = {"id": str(raw.get("id") or f"question_{index + 1}"), "question": str(raw["question"]).strip()}
         options = raw.get("options") if isinstance(raw.get("options"), list) else []
-        if str(raw.get("type") or "").lower() == "choice" and options:
-            normalized_options = []
-            used_values = set()
-            for option_index, option in enumerate(options):
-                if isinstance(option, dict):
-                    value = str(option.get("value") or option.get("id") or option.get("text") or option.get("label") or "").strip()
-                    label = str(option.get("label") or option.get("text") or option.get("name") or value).strip()
-                else:
-                    value = label = str(option).strip()
-                if not value or value in used_values:
-                    value = f"option_{option_index + 1}"
-                if not label:
-                    label = f"选项 {option_index + 1}"
-                used_values.add(value)
-                normalized_options.append({"id": value, "label": label, "value": value})
-            if normalized_options:
-                question.update({"type": "choice", "options": normalized_options, "multiple": bool(raw.get("multiple")), "allowCustomInput": True})
+        normalized_options = []
+        used_values = set()
+        for option_index, option in enumerate(options):
+            if isinstance(option, dict):
+                value = str(option.get("value") or option.get("id") or option.get("text") or option.get("label") or "").strip()
+                label = str(option.get("label") or option.get("text") or option.get("name") or value).strip()
             else:
-                question.update({"type": "confirm", "confirmText": "确认", "cancelText": "取消"})
-        else:
-            question.update({"type": "confirm", "confirmText": str(raw.get("confirmText") or "确认"), "cancelText": str(raw.get("cancelText") or "取消")})
+                value = label = str(option).strip()
+            if not value or value in used_values:
+                value = f"option_{option_index + 1}"
+            if not label:
+                label = f"选项 {option_index + 1}"
+            used_values.add(value)
+            normalized_options.append({"id": value, "label": label, "value": value})
+        if not normalized_options:
+            normalized_options = [
+                {"id": "provide_details", "label": "提供具体信息", "value": "provide_details"},
+                {"id": "not_available", "label": "暂无相关信息", "value": "not_available"},
+            ]
+        question.update({
+            "type": "choice",
+            "options": normalized_options,
+            "multiple": bool(raw.get("multiple")),
+            "allowCustomInput": True,
+            "customInputPlaceholder": str(raw.get("customInputPlaceholder") or "请输入具体信息"),
+        })
         normalized.append(question)
     return {"question": str(payload.get("question") or "请补充以下信息后继续"), "questions": normalized}
 
 
+def build_ask_user_response_decisions(answers: dict) -> list[dict[str, str]]:
+    """Return the HITL response that feeds answers into the suspended ask_user call."""
+    answer_json = json.dumps(answers or {}, ensure_ascii=False)
+    return [{
+        "type": "respond",
+        "message": (
+            "The user has answered the ask_user questions. Treat the following JSON as authoritative "
+            "and continue the original task. Do not ask the same questions again.\n"
+            f"User answers: {answer_json}"
+        ),
+    }]
+
+
 def resolve_run_timeout(payload: DeepRunRequest, settings: Settings) -> int:
     return payload.timeout_seconds if payload.timeout_seconds is not None else settings.run_timeout_seconds
+
+
+def graph_checkpoint_url(database_url: str) -> str:
+    """Convert SQLAlchemy's asyncpg URL to the psycopg URL used by LangGraph."""
+    return database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
 def build_application(settings: Settings | None = None) -> FastAPI:
@@ -73,13 +105,37 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     pending_approvals: dict[str, PendingApproval] = {}
     pending_questions: dict[str, PendingUserQuestion] = {}
     task_plans: dict[str, list[dict[str, str]]] = {}
+    checkpointer = None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        nonlocal checkpointer
         await store.initialize()
-        yield
-        for task in tasks.values():
-            task.cancel()
+        checkpoint_context = None
+        if resolved_settings.database_url.startswith("postgresql"):
+            checkpoint_context = AsyncPostgresSaver.from_conn_string(graph_checkpoint_url(resolved_settings.database_url))
+            checkpointer = await checkpoint_context.__aenter__()
+            await checkpointer.setup()
+        else:
+            # SQLite is retained solely for lightweight unit tests; deployed services require PostgreSQL.
+            checkpointer = InMemorySaver()
+        if hasattr(store, "pause_incomplete_runs"):
+            for interrupted_run_id in await store.pause_incomplete_runs():
+                await store.checkpoint(interrupted_run_id, {"phase": "paused", "reason": "service_restart"})
+        if hasattr(store, "pending_callbacks"):
+            for event in await store.pending_callbacks():
+                try:
+                    await callbacks.send_event(CallbackEvent(event_id=event.event_id, run_id=event.run_id, event_type=event.event_type, occurred_at=event.occurred_at, data=event.data))
+                    await store.mark_callback_delivered(event.event_id)
+                except Exception:
+                    logger.exception("Failed to replay callback %s", event.event_id)
+        try:
+            yield
+        finally:
+            for task in tasks.values():
+                task.cancel()
+            if checkpoint_context is not None:
+                await checkpoint_context.__aexit__(None, None, None)
 
     app = FastAPI(title="Aether Deep Agent Service", version="0.1.0", lifespan=lifespan)
 
@@ -87,8 +143,14 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         await verify_request_signature(request, resolved_settings)
 
     async def safe_callback(run_id: str, event_type: str, data: dict) -> None:
+        event = CallbackEvent(event_id=str(uuid.uuid4()), event_type=event_type, run_id=run_id, occurred_at=int(time.time() * 1000), data=data)
         try:
-            await callbacks.send(run_id, event_type, data)
+            if hasattr(store, "enqueue_callback"):
+                await store.enqueue_callback(event.event_id, run_id, event_type, data, event.occurred_at)
+                await callbacks.send_event(event)
+                await store.mark_callback_delivered(event.event_id)
+            else:
+                await callbacks.send(run_id, event_type, data)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -98,12 +160,18 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         if isinstance(result, PendingApproval):
             if result.actions and result.actions[0].get("name") == "ask_user":
                 pending_questions[request.run_id] = PendingUserQuestion(request, result.actions)
+                if hasattr(store, "save_interaction"):
+                    await store.save_interaction(request.run_id, "ask_user", {"actions": result.actions})
                 await safe_callback(request.run_id, "ask_user.required", normalize_ask_user_payload(result.actions[0].get("args") or {}))
                 return
             pending_approvals[request.run_id] = result
+            if hasattr(store, "save_interaction"):
+                await store.save_interaction(request.run_id, "tool_approval", {"actions": result.actions})
             await safe_callback(request.run_id, "tool.approval.required", {"actions": result.actions})
             return
         pending_approvals.pop(request.run_id, None)
+        if hasattr(store, "take_interaction"):
+            await store.take_interaction(request.run_id)
         await store.update(request.run_id, RunStatus.SUCCEEDED, result=result.content)
         await safe_callback(request.run_id, "run.completed", {
             "content": result.content, "citations": result.citations,
@@ -112,24 +180,28 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             "totalTokens": ((result.prompt_tokens or 0) + (result.completion_tokens or 0)) or None,
         })
 
-    async def run(request: DeepRunRequest, pending: PendingApproval | None = None,
+    async def run(request: DeepRunRequest, pending: PendingApproval | PendingUserQuestion | None = None,
                   decisions: list[dict] | None = None, skip_plan: bool = False) -> None:
         if pending is None:
             await store.update(request.run_id, RunStatus.RUNNING)
+            if hasattr(store, "checkpoint"):
+                await store.checkpoint(request.run_id, {"phase": "running", "task": request.task})
         try:
             if pending is None and not skip_plan:
                 await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
                 task_plan = await executor.plan(request)
                 task_plans[request.run_id] = task_plan
+                if hasattr(store, "checkpoint"):
+                    await store.checkpoint(request.run_id, {"phase": "planned", "tasks": task_plan, "currentStep": 0})
                 await safe_callback(request.run_id, "plan.updated", {
                     "summary": "Task plan created", "maxSteps": request.max_steps,
                     "tasks": update_task_plan(task_plan, active_index=0),
                 })
-                result = await executor.execute(request, lambda event_type, data: safe_callback(request.run_id, event_type, data))
+                result = await executor.execute(request, lambda event_type, data: safe_callback(request.run_id, event_type, data), checkpointer)
             elif pending is None:
-                result = await executor.execute(request, lambda event_type, data: safe_callback(request.run_id, event_type, data))
+                result = await executor.continue_from_checkpoint(request, lambda event_type, data: safe_callback(request.run_id, event_type, data), checkpointer)
             else:
-                result = await executor.resume(pending, decisions or [])
+                result = await executor.resume(request, decisions or [], lambda event_type, data: safe_callback(request.run_id, event_type, data), checkpointer)
             if not isinstance(result, PendingApproval):
                 task_plan = task_plans.pop(request.run_id, task_plans.get(request.run_id, []))
                 if task_plan:
@@ -139,8 +211,12 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                     })
             await finish_execution(request, result)
         except asyncio.CancelledError:
-            await store.update(request.run_id, RunStatus.CANCELLED)
-            await safe_callback(request.run_id, "run.cancelled", {})
+            record = await store.get(request.run_id) if hasattr(store, "get") else None
+            paused = record is not None and record.pause_requested
+            await store.update(request.run_id, RunStatus.PAUSED if paused else RunStatus.CANCELLED)
+            if hasattr(store, "checkpoint"):
+                await store.checkpoint(request.run_id, {"phase": "paused" if paused else "cancelled", "tasks": task_plans.get(request.run_id, [])})
+            await safe_callback(request.run_id, "run.paused" if paused else "run.cancelled", {})
             raise
         except Exception as error:
             message = str(error)
@@ -175,24 +251,62 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             await store.update(run_id, RunStatus.CANCELLED)
         return {"runId": run_id, "status": "CANCELLED"}
 
+    @app.post("/v1/runs/{run_id}/pause", status_code=status.HTTP_202_ACCEPTED,
+              dependencies=[Depends(authenticated)])
+    async def pause_run(run_id: str) -> dict[str, str]:
+        record = await store.request_pause(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        task = tasks.get(run_id)
+        if task is not None and not task.done():
+            task.cancel()
+        else:
+            await store.update(run_id, RunStatus.PAUSED)
+        return {"runId": run_id, "status": "PAUSED"}
+
+    @app.get("/v1/runs/{run_id}", response_model=DeepRunStatusResponse,
+             dependencies=[Depends(authenticated)])
+    async def get_run(run_id: str) -> DeepRunStatusResponse:
+        record, checkpoint_no = await store.status(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        return DeepRunStatusResponse(run_id=run_id, status=RunStatus(record.status), checkpoint_no=checkpoint_no, updated_at=record.updated_at)
+
     @app.post("/v1/runs/{run_id}/resume", status_code=status.HTTP_202_ACCEPTED,
               dependencies=[Depends(authenticated)])
     async def resume_run(run_id: str, payload: ResumeRunRequest) -> dict[str, str]:
         record = await store.get(run_id)
-        question = pending_questions.pop(run_id, None)
-        if question is not None:
-            resumed = question.request.model_copy(update={
-                "task": question.request.task + "\n\nUser answers to ask_user:\n" + json.dumps(payload.answers, ensure_ascii=False),
-            })
-            tasks[run_id] = asyncio.create_task(run(resumed, skip_plan=True))
-            return {"runId": run_id, "status": "RUNNING"}
-        pending = pending_approvals.pop(run_id, None)
         if record is None:
             raise HTTPException(status_code=404, detail="run not found")
-        if pending is None:
-            raise HTTPException(status_code=409, detail="run is not waiting for tool approval")
-        tasks[run_id] = asyncio.create_task(run(pending.request, pending, payload.decisions))
-        return {"runId": run_id, "status": "RUNNING"}
+        question = pending_questions.pop(run_id, None)
+        interaction = None if question is not None else await store.take_interaction(run_id)
+        if question is not None:
+            await store.update(run_id, RunStatus.RUNNING)
+            tasks[run_id] = asyncio.create_task(
+                run(question.request, question, build_ask_user_response_decisions(payload.answers)),
+            )
+            return {"runId": run_id, "status": "RUNNING"}
+        pending = pending_approvals.pop(run_id, None)
+        if interaction is not None and interaction.interaction_type == "ask_user":
+            resumed = DeepRunRequest.model_validate(record.request)
+            restored_question = PendingUserQuestion(resumed, interaction.payload.get("actions", []))
+            await store.update(run_id, RunStatus.RUNNING)
+            tasks[run_id] = asyncio.create_task(
+                run(resumed, restored_question, build_ask_user_response_decisions(payload.answers)),
+            )
+            return {"runId": run_id, "status": "RUNNING"}
+        if pending is not None or (interaction is not None and interaction.interaction_type == "tool_approval"):
+            if pending is None:
+                resumed = DeepRunRequest.model_validate(record.request)
+                pending = PendingApproval(resumed, None, {}, None, interaction.payload.get("actions", []), resumed.timeout_seconds or 0, "")
+            await store.update(run_id, RunStatus.RUNNING)
+            tasks[run_id] = asyncio.create_task(run(pending.request, pending, payload.decisions))
+            return {"runId": run_id, "status": "RUNNING"}
+        if record.status == RunStatus.PAUSED:
+            resumed = DeepRunRequest.model_validate(record.request)
+            tasks[run_id] = asyncio.create_task(run(resumed, skip_plan=True))
+            return {"runId": run_id, "status": "RUNNING"}
+        raise HTTPException(status_code=409, detail="run is not resumable")
 
     return app
 

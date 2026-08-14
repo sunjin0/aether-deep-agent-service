@@ -11,13 +11,12 @@ services:
       AETHER_DEEP_AGENT_CALLBACK_BASE_URL: ${AETHER_DEEP_AGENT_CALLBACK_BASE_URL:-http://aether-admin:8080}
       AETHER_DEEP_AGENT_MCP_URL: ${AETHER_DEEP_AGENT_MCP_URL:-http://aether-mcp:8000/mcp}
       AETHER_DEEP_AGENT_MODEL: ${AETHER_DEEP_AGENT_MODEL:-openai:gpt-4.1-mini}
-      AETHER_DEEP_AGENT_DATABASE_URL: ${AETHER_DEEP_AGENT_DATABASE_URL:-sqlite+aiosqlite:////data/aether_deep_agent.db}
+      # 独立部署复用 Aether 现有 PostgreSQL 开发账户；生产环境必须通过同名变量覆盖。
+      AETHER_DEEP_AGENT_DATABASE_URL: ${AETHER_DEEP_AGENT_DATABASE_URL:-postgresql+asyncpg://sunjin:192837@postgres:5432/aether}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-    volumes:
-      - deep-agent-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health')"]
       interval: 10s
@@ -32,6 +31,3 @@ networks:
   aether-services:
     external: true
     name: ${AETHER_SHARED_NETWORK:-aether-mcp-server_default}
-
-volumes:
-  deep-agent-data:
