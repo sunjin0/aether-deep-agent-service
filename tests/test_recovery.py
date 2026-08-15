@@ -249,3 +249,75 @@ def test_plan_projection_restored_from_checkpoint_on_resume(tmp_path, monkeypatc
         assert tasks[0]["status"] == "running"  # projected active step, not re-executed as completed
 
     asyncio.run(scenario())
+
+
+def test_resume_without_decisions_resurfaces_tool_approval(tmp_path, monkeypatch) -> None:
+    """暂停命中待审批中间态后，空 decisions 恢复不应报错，而是重新投递审批。"""
+    async def scenario() -> None:
+        url = _db_url(tmp_path)
+        store = RunStore(url)
+        await store.initialize()
+        await store.create_if_absent(_deep_request(run_id="run-1"))
+        await store.save_interaction("run-1", "tool_approval", {
+            "actions": [{"name": "http_request", "args": {"url": "https://example.com"}}],
+        })
+        await store.engine.dispose()
+
+        send = AsyncMock()
+        resume = AsyncMock(return_value=_result())
+        monkeypatch.setattr(CallbackClient, "send_event", send)
+        monkeypatch.setattr(DeepAgentExecutor, "resume", resume)
+
+        settings = _settings(url)
+        app = build_application(settings)
+        async with app.router.lifespan_context(app):
+            response = await _post(app, settings, "/v1/runs/run-1/resume", {})
+            assert response.status_code == 202
+            await asyncio.sleep(0.2)
+
+        assert response.json()["status"] == "WAITING_APPROVAL"
+        assert resume.await_count == 0  # 未用空 decisions 盲目恢复图
+        event_types = [call.args[0].event_type for call in send.await_args_list]
+        assert "tool.approval.required" in event_types
+
+        restarted = RunStore(url)
+        await restarted.initialize()
+        interaction = await restarted.take_interaction("run-1")
+        await restarted.engine.dispose()
+        assert interaction is not None and interaction.interaction_type == "tool_approval"
+
+    asyncio.run(scenario())
+
+
+def test_resume_without_answers_resurfaces_ask_user(tmp_path, monkeypatch) -> None:
+    """ask_user 未提供 answers 时同样重新投递提问而非报错。"""
+    async def scenario() -> None:
+        url = _db_url(tmp_path)
+        store = RunStore(url)
+        await store.initialize()
+        await store.create_if_absent(_deep_request(run_id="run-1"))
+        await store.save_interaction("run-1", "ask_user", {
+            "actions": [{"name": "ask_user", "args": {
+                "question": "请选择目标文档", "questions": [{"id": "target", "question": "目标文档？"}],
+            }}],
+        })
+        await store.engine.dispose()
+
+        send = AsyncMock()
+        resume = AsyncMock(return_value=_result())
+        monkeypatch.setattr(CallbackClient, "send_event", send)
+        monkeypatch.setattr(DeepAgentExecutor, "resume", resume)
+
+        settings = _settings(url)
+        app = build_application(settings)
+        async with app.router.lifespan_context(app):
+            response = await _post(app, settings, "/v1/runs/run-1/resume", {})
+            assert response.status_code == 202
+            await asyncio.sleep(0.2)
+
+        assert response.json()["status"] == "WAITING_USER"
+        assert resume.await_count == 0
+        event_types = [call.args[0].event_type for call in send.await_args_list]
+        assert "ask_user.required" in event_types
+
+    asyncio.run(scenario())

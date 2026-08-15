@@ -340,9 +340,26 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         record = await store.get(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="run not found")
+
+        async def resurface_interaction(interaction_type: str, actions: list[dict]) -> dict[str, str]:
+            """保持等待状态并重新投递审批/提问，而不是用空 decisions 盲目恢复图。
+
+            暂停可能命中"待审批工具调用"的中间态；此时用户应先回答而非继续，
+            因此重新持久化交互并通知前端，避免 0 decisions vs N hanging tool calls。
+            """
+            await store.save_interaction(run_id, interaction_type, {"actions": actions})
+            if interaction_type == "ask_user":
+                first = actions[0] if actions else {}
+                await safe_callback(run_id, "ask_user.required", normalize_ask_user_payload(first.get("args") or {}))
+                return {"runId": run_id, "status": "WAITING_USER"}
+            await safe_callback(run_id, "tool.approval.required", {"actions": actions})
+            return {"runId": run_id, "status": "WAITING_APPROVAL"}
+
         question = pending_questions.pop(run_id, None)
         interaction = None if question is not None else await store.take_interaction(run_id)
         if question is not None:
+            if not payload.answers:
+                return await resurface_interaction("ask_user", question.actions)
             await store.update(run_id, RunStatus.RUNNING)
             tasks[run_id] = asyncio.create_task(
                 run(question.request, question, build_ask_user_response_decisions(payload.answers)),
@@ -350,6 +367,8 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             return {"runId": run_id, "status": "RUNNING"}
         pending = pending_approvals.pop(run_id, None)
         if interaction is not None and interaction.interaction_type == "ask_user":
+            if not payload.answers:
+                return await resurface_interaction("ask_user", interaction.payload.get("actions", []))
             resumed = DeepRunRequest.model_validate(record.request)
             restored_question = PendingUserQuestion(resumed, interaction.payload.get("actions", []))
             await store.update(run_id, RunStatus.RUNNING)
@@ -358,9 +377,12 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             )
             return {"runId": run_id, "status": "RUNNING"}
         if pending is not None or (interaction is not None and interaction.interaction_type == "tool_approval"):
+            actions = interaction.payload.get("actions", []) if interaction is not None else pending.actions
+            if not payload.decisions:
+                return await resurface_interaction("tool_approval", actions)
             if pending is None:
                 resumed = DeepRunRequest.model_validate(record.request)
-                pending = PendingApproval(resumed, None, {}, None, interaction.payload.get("actions", []), resumed.timeout_seconds or 0, "")
+                pending = PendingApproval(resumed, None, {}, None, actions, resumed.timeout_seconds or 0, "")
             await store.update(run_id, RunStatus.RUNNING)
             tasks[run_id] = asyncio.create_task(run(pending.request, pending, payload.decisions))
             return {"runId": run_id, "status": "RUNNING"}
