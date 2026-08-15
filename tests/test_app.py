@@ -23,8 +23,11 @@ def test_health() -> None:
         assert client.get("/health").json() == {"status": "ok"}
 
 
-def test_create_run_requires_valid_signature() -> None:
+def test_create_run_requires_valid_signature(monkeypatch) -> None:
+    # 真实后台运行会做回调投递；空 callback_base_url 下 httpx 在 Windows 的
+    # TestClient 退出取消时可能挂起。mock 投递层使后台任务立即结束，不依赖网络。
     settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send_event", AsyncMock())
     app = build_application(settings)
     payload = {
         "run_id": "run-1", "user_id": "user-1", "agent_id": "agent-1",
@@ -41,6 +44,8 @@ def test_create_run_requires_valid_signature() -> None:
     }
     with TestClient(app) as client:
         response = client.post("/v1/runs", content=body, headers=headers)
+        # 让后台 run 任务在 TestClient 退出前跑完，避免 Windows 下取消 sqlite 操作挂起。
+        client.portal.call(asyncio.sleep, 0.2)
     assert response.status_code == 202
     assert response.json()["run_id"] == "run-1"
     assert response.json()["created"] is True
@@ -52,7 +57,8 @@ def test_session_task_alias_persists_session_and_exposes_latest_status(monkeypat
     monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", AsyncMock(return_value=ExecutionResult(
         content="Result", citations=[], model="test-model", tools=[], prompt_tokens=None, completion_tokens=None,
     )))
-    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", AsyncMock())
+    # 真实 RunStore 下 safe_callback 走 send_event；mock 投递层避免真实网络请求。
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send_event", AsyncMock())
     payload = {
         "run_id": "session-run-1", "user_id": "user-1", "agent_id": "agent-1",
         "conversation_id": "conversation-1", "task_id": "task-1",
@@ -75,6 +81,8 @@ def test_session_task_alias_persists_session_and_exposes_latest_status(monkeypat
             "X-Aether-Timestamp": get_timestamp,
             "X-Aether-Signature": build_signature(settings.shared_secret, get_timestamp, b""),
         })
+        # 让后台 run 任务在 TestClient 退出前跑完，避免 Windows 下取消挂起。
+        client.portal.call(asyncio.sleep, 0.3)
     assert queried.status_code == 200
     assert queried.json()["run_id"] == "session-run-1"
     assert queried.json()["task_id"] == "task-1"

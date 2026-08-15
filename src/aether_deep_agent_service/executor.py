@@ -15,6 +15,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from .callbacks import CallbackClient
 from .schemas import DeepRunRequest
 from .settings import Settings
 
@@ -126,14 +127,45 @@ class RunTelemetryHandler(AsyncCallbackHandler):
 
 
 class DeepAgentExecutor:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, callbacks: CallbackClient | None = None) -> None:
         self.settings = settings
+        self._callbacks = callbacks
+        self._model_config_cache: dict[str, dict] = {}
+
+    async def _resolve_model(self, request: DeepRunRequest) -> tuple[str, str | None, str | None]:
+        """按 Admin 的 agent/provider 配置解析 (model, base_url, api_key)。
+
+        apiKey 通过签名内部通道按需拉取，只在内存中缓存，绝不持久化；
+        Admin 不可达时回退到环境变量配置的模型。
+        """
+        if self._callbacks is not None and request.agent_id:
+            cached = self._model_config_cache.get(request.agent_id)
+            if cached is None:
+                cached = await self._callbacks.fetch_model_config(request.agent_id)
+                if cached is not None:
+                    self._model_config_cache[request.agent_id] = cached
+            if cached and cached.get("model"):
+                return cached["model"], cached.get("base_url"), cached.get("api_key")
+        if not self.settings.model:
+            raise RuntimeError("模型未配置：无法从 Admin 获取且 AETHER_DEEP_AGENT_MODEL 为空")
+        model = self.settings.model if ":" in self.settings.model else "openai:" + self.settings.model
+        return model, None, None
+
+    @staticmethod
+    def _model_kwargs(base_url: str | None, api_key: str | None) -> dict[str, str]:
+        kwargs: dict[str, str] = {}
+        if base_url:
+            kwargs["base_url"] = base_url
+        if api_key:
+            kwargs["api_key"] = api_key
+        return kwargs
 
     async def plan(self, request: DeepRunRequest) -> list[dict[str, str]]:
         """Use the configured model to turn the user's request into an executable task plan."""
-        if not self.settings.model:
+        try:
+            model, base_url, api_key = await self._resolve_model(request)
+        except Exception:
             return self._fallback_plan(request.task)
-        model = self.settings.model if ":" in self.settings.model else "openai:" + self.settings.model
         prompt = (
             "Create a concise execution plan for the user's task. Return JSON only in this exact shape: "
             '{"tasks":[{"title":"..."}]}. Generate 3 to 6 concrete, ordered steps. '
@@ -142,7 +174,7 @@ class DeepAgentExecutor:
             f"User task:\n{request.task}"
         )
         try:
-            planner = init_chat_model(model, use_responses_api=False)
+            planner = init_chat_model(model, use_responses_api=False, **self._model_kwargs(base_url, api_key))
             response = await asyncio.wait_for(
                 planner.ainvoke([{"role": "user", "content": prompt}]),
                 timeout=min(request.timeout_seconds or self.settings.run_timeout_seconds, 60),
@@ -161,9 +193,10 @@ class DeepAgentExecutor:
         a planning call can never repeat a side-effecting tool invocation.
         """
         completed = [dict(item) for item in previous_plan if item.get("status") == "completed"]
-        if not self.settings.model:
+        try:
+            model, base_url, api_key = await self._resolve_model(request)
+        except Exception:
             return completed + self._fallback_replan(request.task, reason, observation, len(completed))
-        model = self.settings.model if ":" in self.settings.model else "openai:" + self.settings.model
         previous = json.dumps(previous_plan, ensure_ascii=False)
         prompt = (
             "Revise the execution plan after a runtime observation. Return JSON only in this exact shape: "
@@ -175,7 +208,7 @@ class DeepAgentExecutor:
             f"Previous plan:\n{previous}"
         )
         try:
-            planner = init_chat_model(model, use_responses_api=False)
+            planner = init_chat_model(model, use_responses_api=False, **self._model_kwargs(base_url, api_key))
             response = await asyncio.wait_for(
                 planner.ainvoke([{"role": "user", "content": prompt}]),
                 timeout=min(request.timeout_seconds or self.settings.run_timeout_seconds, 60),
@@ -240,12 +273,10 @@ class DeepAgentExecutor:
         return self._result_or_pending(state, request, agent, config, telemetry, model)
 
     async def _create_agent(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> tuple[Any, dict[str, Any], RunTelemetryHandler, str]:
-        if not self.settings.model:
-            raise RuntimeError("AETHER_DEEP_AGENT_MODEL is not configured")
-
-        # Java 模型供应商使用 OpenAI 兼容端点时通常只保存模型名（如 deepseek-v4-flash）。
-        # 显式补充 provider，避免 LangChain 将其误判为需要额外 SDK 的原生 DeepSeek 模型。
-        model = self.settings.model if ":" in self.settings.model else "openai:" + self.settings.model
+        # 模型配置（model/baseUrl/apiKey）优先来自 Admin 的 agent/provider 解析；
+        # Java 供应商通常只保存模型名（如 deepseek-v4-flash），显式补充 provider
+        # 避免 LangChain 将其误判为需要额外 SDK 的原生 DeepSeek 模型。
+        model, model_base_url, model_api_key = await self._resolve_model(request)
 
         register_harness_profile(
             model,
@@ -273,7 +304,11 @@ class DeepAgentExecutor:
         telemetry = RunTelemetryHandler(emit)
         # DeepSeek 的 OpenAI 兼容端点支持 Chat Completions，不提供 Responses API。
         # 预初始化模型以明确关闭 Responses API，避免客户端请求 /responses 返回 404。
-        chat_model = init_chat_model(model, use_responses_api=False, streaming=True)
+        # base_url/api_key 来自 Admin 的 provider 配置，仅在内存中使用。
+        chat_model = init_chat_model(
+            model, use_responses_api=False, streaming=True,
+            **self._model_kwargs(model_base_url, model_api_key),
+        )
         # `never` is an explicit run-scoped grant issued by Java. Other policies
         # interrupt here; Java evaluates per-action risk and auto-resumes a
         # low-risk `risky` batch without exposing a confirmation card.

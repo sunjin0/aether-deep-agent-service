@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 import uuid
 
@@ -7,6 +8,8 @@ import httpx
 from .schemas import CallbackEvent
 from .security import build_signature
 from .settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class CallbackClient:
@@ -24,6 +27,39 @@ class CallbackClient:
 
     async def send_event(self, event: CallbackEvent) -> None:
         await self._send_with_retry(event.run_id, event)
+
+    async def fetch_model_config(self, agent_id: str) -> dict | None:
+        """从 Admin 拉取已解析的模型配置（model/baseUrl/apiKey）。
+
+        apiKey 仅通过签名内部通道返回，调用方只在内存中使用，本服务不持久化。
+        """
+        if not self.settings.callback_base_url:
+            return None
+        url = f"{self.settings.callback_base_url.rstrip('/')}/api/agent/deep/model-config/{agent_id}"
+        timestamp = str(int(time.time()))
+        signature = build_signature(self.settings.shared_secret, timestamp, b"")
+        headers = {
+            "X-Aether-Key-Id": self.settings.key_id,
+            "X-Aether-Timestamp": timestamp,
+            "X-Aether-Signature": signature,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.callback_timeout_seconds) as client:
+                response = await client.get(url, headers=headers)
+            if response.status_code != 200:
+                logger.warning("model config fetch failed: agentId=%s status=%s", agent_id, response.status_code)
+                return None
+            data = response.json()
+            if not data.get("model"):
+                return None
+            return {
+                "model": data["model"],
+                "base_url": data.get("baseUrl"),
+                "api_key": data.get("apiKey"),
+            }
+        except Exception:
+            logger.exception("model config fetch error: agentId=%s", agent_id)
+            return None
 
     async def _send_with_retry(self, run_id: str, event: CallbackEvent) -> None:
         body = event.model_dump_json().encode("utf-8")
