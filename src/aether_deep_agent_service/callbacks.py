@@ -35,7 +35,7 @@ class CallbackClient:
         """
         if not self.settings.callback_base_url:
             return None
-        url = f"{self.settings.callback_base_url.rstrip('/')}/api/agent/deep/model-config/{agent_id}"
+        url = f"{self.settings.callback_base_url.rstrip('/')}/api/agent/deep-runs/model-config/{agent_id}"
         timestamp = str(int(time.time()))
         signature = build_signature(self.settings.shared_secret, timestamp, b"")
         headers = {

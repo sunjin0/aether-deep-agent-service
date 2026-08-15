@@ -113,3 +113,26 @@ def test_normalize_citation_format_supports_half_width_model_output() -> None:
     assert DeepAgentExecutor._normalize_citation_format(content) == (
         "依据：【4】，并保留【5】和 Markdown [链接](https://example.test)。"
     )
+
+
+async def test_resolve_model_prefixes_admin_provider_model(monkeypatch) -> None:
+    from aether_deep_agent_service.callbacks import CallbackClient
+
+    settings = Settings()
+    callbacks = CallbackClient(settings)
+    executor = DeepAgentExecutor(settings, callbacks)
+
+    async def fake_fetch(_agent_id):
+        return {"model": "deepseek-v4-flash", "base_url": "https://api.deepseek.com", "api_key": "secret"}
+
+    monkeypatch.setattr(callbacks, "fetch_model_config", fake_fetch)
+    request = DeepRunRequest(
+        run_id="run-1", user_id="user-1", agent_id="agent-1", conversation_id="conversation-1",
+        task="t", delegation_token="tok",
+    )
+
+    model, base_url, api_key = await executor._resolve_model(request)
+
+    assert model == "openai:deepseek-v4-flash"  # Admin 的 OpenAI 兼容 provider 需补充前缀
+    assert base_url == "https://api.deepseek.com"
+    assert api_key == "secret"

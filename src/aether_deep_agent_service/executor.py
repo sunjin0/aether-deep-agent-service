@@ -145,7 +145,10 @@ class DeepAgentExecutor:
                 if cached is not None:
                     self._model_config_cache[request.agent_id] = cached
             if cached and cached.get("model"):
-                return cached["model"], cached.get("base_url"), cached.get("api_key")
+                # Admin 的 provider 为 OpenAI 兼容端点，只存模型名；显式补充
+                # provider 前缀，避免 LangChain 误判为原生 DeepSeek 模型。
+                model = cached["model"] if ":" in cached["model"] else "openai:" + cached["model"]
+                return model, cached.get("base_url"), cached.get("api_key")
         if not self.settings.model:
             raise RuntimeError("模型未配置：无法从 Admin 获取且 AETHER_DEEP_AGENT_MODEL 为空")
         model = self.settings.model if ":" in self.settings.model else "openai:" + self.settings.model
