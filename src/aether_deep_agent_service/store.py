@@ -20,6 +20,8 @@ class RunRecord(Base):
     __tablename__ = "deep_agent_run"
 
     run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     request: Mapped[dict] = mapped_column(JsonValue, nullable=False)
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -83,6 +85,8 @@ class RunStore:
                 return existing, False
             record = RunRecord(
                 run_id=request.run_id,
+                session_id=request.session_id,
+                task_id=request.task_id,
                 status=RunStatus.QUEUED,
                 request=request.model_dump(mode="json"),
                 created_at=now,
@@ -95,6 +99,14 @@ class RunStore:
     async def get(self, run_id: str) -> RunRecord | None:
         async with self.sessions() as session:
             return await session.get(RunRecord, run_id)
+
+    async def latest_for_session(self, session_id: str, task_id: str | None = None) -> RunRecord | None:
+        async with self.sessions() as session:
+            query = select(RunRecord).where(RunRecord.session_id == session_id)
+            if task_id is not None:
+                query = query.where(RunRecord.task_id == task_id)
+            query = query.order_by(RunRecord.updated_at.desc(), RunRecord.created_at.desc()).limit(1)
+            return (await session.execute(query)).scalar_one_or_none()
 
     async def update(self, run_id: str, status: RunStatus, result: str | None = None,
                      error: str | None = None) -> None:

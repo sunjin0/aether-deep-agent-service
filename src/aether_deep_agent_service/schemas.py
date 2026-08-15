@@ -26,13 +26,23 @@ class KnowledgeSource(BaseModel):
     retrievalScore: float | None = None
 
 
+class ConversationMemoryMessage(BaseModel):
+    """A bounded, persisted message supplied from the owning conversation."""
+    role: str = Field(pattern="^(system|user|assistant)$")
+    content: str = Field(min_length=1, max_length=24000)
+
+
 class DeepRunRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=64)
     user_id: str = Field(min_length=1, max_length=64)
     agent_id: str = Field(min_length=1, max_length=64)
     conversation_id: str = Field(min_length=1, max_length=64)
+    session_id: str | None = Field(default=None, min_length=1, max_length=64)
+    task_id: str | None = Field(default=None, min_length=1, max_length=64)
     task: str = Field(min_length=1, max_length=20000)
+    task_state: dict[str, Any] = Field(default_factory=dict)
     system_prompt: str = ""
+    conversation_memory: list[ConversationMemoryMessage] = Field(default_factory=list, max_length=24)
     knowledge_sources: list[KnowledgeSource] = Field(default_factory=list)
     allowed_tools: list[str] = Field(default_factory=list)
     delegation_token: str = Field(min_length=1)
@@ -57,6 +67,16 @@ class DeepRunStatusResponse(BaseModel):
     status: RunStatus
     checkpoint_no: int = 0
     updated_at: int
+
+
+class DeepSessionStatusResponse(BaseModel):
+    """Latest durable execution state for one Admin-owned Agent Session."""
+    session_id: str
+    task_id: str | None = None
+    run_id: str | None = None
+    status: RunStatus | None = None
+    checkpoint_no: int = 0
+    updated_at: int | None = None
 
 
 class CallbackEvent(BaseModel):

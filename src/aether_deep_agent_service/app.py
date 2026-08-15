@@ -11,7 +11,8 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from .callbacks import CallbackClient
 from .executor import DeepAgentExecutor, ExecutionResult, PendingApproval, PendingUserQuestion
-from .schemas import CallbackEvent, DeepRunRequest, DeepRunResponse, DeepRunStatusResponse, ResumeRunRequest, RunStatus
+from .schemas import (CallbackEvent, DeepRunRequest, DeepRunResponse, DeepRunStatusResponse,
+                      DeepSessionStatusResponse, ResumeRunRequest, RunStatus)
 from .security import verify_request_signature
 from .settings import Settings, get_settings
 from .store import RunStore
@@ -182,6 +183,52 @@ def build_application(settings: Settings | None = None) -> FastAPI:
 
     async def run(request: DeepRunRequest, pending: PendingApproval | PendingUserQuestion | None = None,
                   decisions: list[dict] | None = None, skip_plan: bool = False) -> None:
+        task_plan = task_plans.get(request.run_id, [])
+        # The in-memory task plan is merely a delivery cache. Restore the latest
+        # durable projection after a service restart so resume/completion does
+        # not discard the user's visible plan.
+        if not task_plan and hasattr(store, "latest_checkpoint"):
+            checkpoint = await store.latest_checkpoint(request.run_id)
+            checkpoint_tasks = checkpoint.state.get("tasks") if checkpoint is not None and isinstance(checkpoint.state, dict) else None
+            if isinstance(checkpoint_tasks, list):
+                task_plan = [dict(item) for item in checkpoint_tasks if isinstance(item, dict)]
+                if task_plan:
+                    task_plans[request.run_id] = task_plan
+                    request.task_state["plan"] = task_plan
+                    request.task_state["plan_reason"] = checkpoint.state.get("planReason", "RESUME")
+
+        async def publish_plan(reason: str, summary: str, plan: list[dict[str, str]],
+                               active_index: int | None = 0, completed: bool = False) -> None:
+            projected = update_task_plan(plan, active_index=active_index, completed=completed)
+            task_plans[request.run_id] = projected
+            request.task_state["plan"] = projected
+            request.task_state["plan_reason"] = reason
+            if hasattr(store, "checkpoint"):
+                await store.checkpoint(request.run_id, {
+                    "phase": "replanned" if reason not in {"INITIAL", "COMPLETED"} else "planned",
+                    "tasks": projected,
+                    "currentStep": active_index or 0,
+                    "planReason": reason,
+                })
+            await safe_callback(request.run_id, "plan.updated", {
+                "reason": reason, "summary": summary, "maxSteps": request.max_steps,
+                "tasks": projected,
+            })
+
+        async def emit_runtime_event(event_type: str, data: dict) -> None:
+            nonlocal task_plan
+            await safe_callback(request.run_id, event_type, data)
+            # Tool observations can change the viable path. Replan before the
+            # graph decides its next action; the plan projection itself has no
+            # authority to replay a side-effecting tool.
+            if event_type in {"tool.completed", "tool.failed"} and task_plan:
+                failed = event_type == "tool.failed"
+                reason = "STEP_FAILED" if failed else "TOOL_RESULT"
+                observation = str(data.get("error") or data.get("outputSummary") or data.get("message")
+                                  or ("工具调用失败" if failed else "工具调用完成"))
+                task_plan = await executor.replan(request, task_plan, reason, observation)
+                await publish_plan(reason, "工具调用失败，已调整后续计划" if failed else "已根据工具结果调整后续计划", task_plan)
+
         if pending is None:
             await store.update(request.run_id, RunStatus.RUNNING)
             if hasattr(store, "checkpoint"):
@@ -190,25 +237,22 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             if pending is None and not skip_plan:
                 await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
                 task_plan = await executor.plan(request)
-                task_plans[request.run_id] = task_plan
-                if hasattr(store, "checkpoint"):
-                    await store.checkpoint(request.run_id, {"phase": "planned", "tasks": task_plan, "currentStep": 0})
-                await safe_callback(request.run_id, "plan.updated", {
-                    "summary": "Task plan created", "maxSteps": request.max_steps,
-                    "tasks": update_task_plan(task_plan, active_index=0),
-                })
-                result = await executor.execute(request, lambda event_type, data: safe_callback(request.run_id, event_type, data), checkpointer)
+                await publish_plan("INITIAL", "Task plan created", task_plan)
+                result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None:
-                result = await executor.continue_from_checkpoint(request, lambda event_type, data: safe_callback(request.run_id, event_type, data), checkpointer)
+                if task_plan:
+                    await publish_plan("RESUME", "从最近检查点继续执行", task_plan)
+                result = await executor.continue_from_checkpoint(request, emit_runtime_event, checkpointer)
             else:
-                result = await executor.resume(request, decisions or [], lambda event_type, data: safe_callback(request.run_id, event_type, data), checkpointer)
+                if isinstance(pending, PendingUserQuestion) and task_plan:
+                    observation = str((decisions or [{}])[0].get("message") or "用户已补充信息")
+                    task_plan = await executor.replan(request, task_plan, "USER_INPUT", observation)
+                    await publish_plan("USER_INPUT", "已根据用户补充信息调整计划", task_plan)
+                result = await executor.resume(request, decisions or [], emit_runtime_event, checkpointer)
             if not isinstance(result, PendingApproval):
                 task_plan = task_plans.pop(request.run_id, task_plans.get(request.run_id, []))
                 if task_plan:
-                    await safe_callback(request.run_id, "plan.updated", {
-                        "summary": "Task plan completed", "maxSteps": request.max_steps,
-                        "tasks": update_task_plan(task_plan, completed=True),
-                    })
+                    await publish_plan("COMPLETED", "Task plan completed", task_plan, completed=True)
             await finish_execution(request, result)
         except asyncio.CancelledError:
             record = await store.get(request.run_id) if hasattr(store, "get") else None
@@ -237,6 +281,14 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         if created:
             tasks[payload.run_id] = asyncio.create_task(run(payload))
         return DeepRunResponse(run_id=record.run_id, status=RunStatus(record.status), created=created)
+
+    @app.post("/v1/sessions/{session_id}/tasks", response_model=DeepRunResponse,
+              status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(authenticated)])
+    async def create_session_task(session_id: str, payload: DeepRunRequest) -> DeepRunResponse:
+        """Session-scoped alias for new clients; legacy Admin callers keep using /v1/runs."""
+        if payload.session_id is not None and payload.session_id != session_id:
+            raise HTTPException(status_code=422, detail="session_id does not match request path")
+        return await create_run(payload.model_copy(update={"session_id": session_id}))
 
     @app.post("/v1/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED,
               dependencies=[Depends(authenticated)])
@@ -272,9 +324,19 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="run not found")
         return DeepRunStatusResponse(run_id=run_id, status=RunStatus(record.status), checkpoint_no=checkpoint_no, updated_at=record.updated_at)
 
-    @app.post("/v1/runs/{run_id}/resume", status_code=status.HTTP_202_ACCEPTED,
-              dependencies=[Depends(authenticated)])
-    async def resume_run(run_id: str, payload: ResumeRunRequest) -> dict[str, str]:
+    @app.get("/v1/sessions/{session_id}", response_model=DeepSessionStatusResponse,
+             dependencies=[Depends(authenticated)])
+    async def get_session(session_id: str) -> DeepSessionStatusResponse:
+        record = await store.latest_for_session(session_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        _, checkpoint_no = await store.status(record.run_id)
+        return DeepSessionStatusResponse(
+            session_id=session_id, task_id=record.task_id, run_id=record.run_id,
+            status=RunStatus(record.status), checkpoint_no=checkpoint_no, updated_at=record.updated_at,
+        )
+
+    async def resume_existing_run(run_id: str, payload: ResumeRunRequest) -> dict[str, str]:
         record = await store.get(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="run not found")
@@ -307,6 +369,19 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             tasks[run_id] = asyncio.create_task(run(resumed, skip_plan=True))
             return {"runId": run_id, "status": "RUNNING"}
         raise HTTPException(status_code=409, detail="run is not resumable")
+
+    @app.post("/v1/runs/{run_id}/resume", status_code=status.HTTP_202_ACCEPTED,
+              dependencies=[Depends(authenticated)])
+    async def resume_run(run_id: str, payload: ResumeRunRequest) -> dict[str, str]:
+        return await resume_existing_run(run_id, payload)
+
+    @app.post("/v1/sessions/{session_id}/tasks/{task_id}/resume", status_code=status.HTTP_202_ACCEPTED,
+              dependencies=[Depends(authenticated)])
+    async def resume_session_task(session_id: str, task_id: str, payload: ResumeRunRequest) -> dict[str, str]:
+        record = await store.latest_for_session(session_id, task_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="task not found in session")
+        return await resume_existing_run(record.run_id, payload)
 
     return app
 

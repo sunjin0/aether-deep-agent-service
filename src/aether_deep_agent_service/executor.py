@@ -152,6 +152,42 @@ class DeepAgentExecutor:
             # The run can still proceed when a model provider does not support a separate planning call.
             return self._fallback_plan(request.task)
 
+    async def replan(self, request: DeepRunRequest, previous_plan: list[dict[str, str]],
+                     reason: str, observation: str) -> list[dict[str, str]]:
+        """Create a new user-visible plan after a material execution observation.
+
+        This deliberately changes only the auditable plan projection. The durable
+        LangGraph state remains the authority for the next executable action, so
+        a planning call can never repeat a side-effecting tool invocation.
+        """
+        completed = [dict(item) for item in previous_plan if item.get("status") == "completed"]
+        if not self.settings.model:
+            return completed + self._fallback_replan(request.task, reason, observation, len(completed))
+        model = self.settings.model if ":" in self.settings.model else "openai:" + self.settings.model
+        previous = json.dumps(previous_plan, ensure_ascii=False)
+        prompt = (
+            "Revise the execution plan after a runtime observation. Return JSON only in this exact shape: "
+            '{"tasks":[{"title":"..."}]}. Return 1 to 5 concrete remaining steps. '
+            "Do not repeat completed steps, do not answer the task, and do not call tools.\n\n"
+            f"User task:\n{request.task}\n\n"
+            f"Replan reason: {reason}\n"
+            f"Observation (may be summarized):\n{observation[:1000]}\n\n"
+            f"Previous plan:\n{previous}"
+        )
+        try:
+            planner = init_chat_model(model, use_responses_api=False)
+            response = await asyncio.wait_for(
+                planner.ainvoke([{"role": "user", "content": prompt}]),
+                timeout=min(request.timeout_seconds or self.settings.run_timeout_seconds, 60),
+            )
+            remaining = self._parse_plan(getattr(response, "content", ""), request.task)
+        except Exception:
+            remaining = self._fallback_replan(request.task, reason, observation, len(completed))
+        for index, item in enumerate(remaining, start=len(completed) + 1):
+            item["id"] = f"replan-{index}"
+            item["status"] = "pending"
+        return completed + remaining
+
     @staticmethod
     def _parse_plan(content: Any, task: str) -> list[dict[str, str]]:
         if not isinstance(content, str):
@@ -175,11 +211,20 @@ class DeepAgentExecutor:
         title = task.strip().replace("\n", " ")[:80] or "完成当前任务"
         return [{"id": "task-1", "title": title, "status": "pending"}]
 
+    @staticmethod
+    def _fallback_replan(task: str, reason: str, observation: str, completed_count: int) -> list[dict[str, str]]:
+        detail = observation.strip().replace("\n", " ")[:80]
+        suffix = f"（{detail}）" if detail else ""
+        title = task.strip().replace("\n", " ")[:70] or "完成当前任务"
+        return [{
+            "id": f"replan-{completed_count + 1}",
+            "title": f"根据{reason}调整后继续处理：{title}{suffix}",
+            "status": "pending",
+        }]
+
     async def execute(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
         agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
-        state = await asyncio.wait_for(agent.ainvoke({"messages": [{"role": "user", "content": (
-            f"Task:\n{request.task}\n\nEvidence:\n{self._source_context(request)}"
-        )}]}, config=config), timeout=request.timeout_seconds)
+        state = await asyncio.wait_for(agent.ainvoke({"messages": self._initial_messages(request)}, config=config), timeout=request.timeout_seconds)
         return self._result_or_pending(state, request, agent, config, telemetry, model)
 
     async def continue_from_checkpoint(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
@@ -216,6 +261,12 @@ class DeepAgentExecutor:
             "Use 1-4 structured choice questions, each with 2-4 concrete options; the user can also provide custom input. "
             "After answers are returned, treat them as authoritative and continue without repeating the same question."
         )
+        if request.task_state:
+            instructions += (
+                "\n\nCurrent durable task state (a concise execution projection, not hidden reasoning):\n"
+                + json.dumps(request.task_state, ensure_ascii=False)
+                + "\nUse verified tool results to adjust the next action; do not repeat completed work."
+            )
         tools = await self._load_mcp_tools(request)
         tools.append(ask_user)
         await emit("step.started", {"message": "Preparing delegated MCP tools", "toolCount": len(tools)})
@@ -240,9 +291,17 @@ class DeepAgentExecutor:
         config = {
             "recursion_limit": recursion_limit,
             "callbacks": [telemetry],
-            "configurable": {"thread_id": request.run_id},
+            # A session is durable across user requests. run_id remains an
+            # execution-attempt/audit identifier rather than the memory key.
+            "configurable": {"thread_id": request.session_id or request.conversation_id},
         }
         return agent, config, telemetry, model
+
+    @staticmethod
+    def _initial_messages(request: DeepRunRequest) -> list[dict[str, str]]:
+        messages = [{"role": item.role, "content": item.content} for item in request.conversation_memory]
+        messages.append({"role": "user", "content": f"Task:\n{request.task}\n\nEvidence:\n{DeepAgentExecutor._source_context(request)}"})
+        return messages
 
     @staticmethod
     def _source_context(request: DeepRunRequest) -> str:

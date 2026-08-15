@@ -41,6 +41,36 @@ def test_parse_plan_keeps_task_specific_titles() -> None:
     ]
 
 
+async def test_replan_preserves_completed_steps_without_model() -> None:
+    executor = DeepAgentExecutor(Settings())
+    request = DeepRunRequest(
+        run_id="run-1", user_id="user-1", agent_id="agent-1", conversation_id="conversation-1",
+        task="审查合同风险", delegation_token="java-issued-token",
+    )
+
+    tasks = await executor.replan(request, [
+        {"id": "task-1", "title": "提取条款", "status": "completed"},
+        {"id": "task-2", "title": "分析风险", "status": "running"},
+    ], "STEP_FAILED", "文档解析工具超时")
+
+    assert tasks[0] == {"id": "task-1", "title": "提取条款", "status": "completed"}
+    assert tasks[1]["id"] == "replan-2"
+    assert tasks[1]["status"] == "pending"
+
+
+def test_initial_messages_include_persisted_conversation_memory_before_current_task() -> None:
+    request = DeepRunRequest(
+        run_id="run-1", user_id="user-1", agent_id="agent-1", conversation_id="conversation-1",
+        session_id="session-1", task="继续处理", delegation_token="java-issued-token",
+        conversation_memory=[{"role": "assistant", "content": "前序结论"}],
+    )
+
+    messages = DeepAgentExecutor._initial_messages(request)
+
+    assert messages[0] == {"role": "assistant", "content": "前序结论"}
+    assert "继续处理" in messages[-1]["content"]
+
+
 def test_deep_run_request_accepts_only_known_tool_approval_policies() -> None:
     request = DeepRunRequest(
         run_id="run-1", user_id="user-1", agent_id="agent-1", conversation_id="conversation-1",

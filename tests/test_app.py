@@ -46,6 +46,59 @@ def test_create_run_requires_valid_signature() -> None:
     assert response.json()["created"] is True
 
 
+def test_session_task_alias_persists_session_and_exposes_latest_status(monkeypatch) -> None:
+    settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan", AsyncMock(return_value=[{"title": "准备证据"}]))
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", AsyncMock(return_value=ExecutionResult(
+        content="Result", citations=[], model="test-model", tools=[], prompt_tokens=None, completion_tokens=None,
+    )))
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", AsyncMock())
+    payload = {
+        "run_id": "session-run-1", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "task_id": "task-1",
+        "task": "Summarize the supplied evidence.", "delegation_token": "delegation-token",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    headers = {
+        "X-Aether-Key-Id": settings.key_id,
+        "X-Aether-Timestamp": timestamp,
+        "X-Aether-Signature": build_signature(settings.shared_secret, timestamp, body),
+        "Content-Type": "application/json",
+    }
+    with TestClient(build_application(settings)) as client:
+        created = client.post("/v1/sessions/session-1/tasks", content=body, headers=headers)
+        assert created.status_code == 202
+        get_timestamp = str(int(time.time()))
+        queried = client.get("/v1/sessions/session-1", headers={
+            "X-Aether-Key-Id": settings.key_id,
+            "X-Aether-Timestamp": get_timestamp,
+            "X-Aether-Signature": build_signature(settings.shared_secret, get_timestamp, b""),
+        })
+    assert queried.status_code == 200
+    assert queried.json()["run_id"] == "session-run-1"
+    assert queried.json()["task_id"] == "task-1"
+
+
+def test_session_task_alias_rejects_mismatched_session_id() -> None:
+    settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+    payload = {
+        "run_id": "session-mismatch", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "session_id": "another-session",
+        "task": "Summarize the supplied evidence.", "delegation_token": "delegation-token",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    with TestClient(build_application(settings)) as client:
+        response = client.post("/v1/sessions/session-1/tasks", content=body, headers={
+            "X-Aether-Key-Id": settings.key_id,
+            "X-Aether-Timestamp": timestamp,
+            "X-Aether-Signature": build_signature(settings.shared_secret, timestamp, body),
+            "Content-Type": "application/json",
+        })
+    assert response.status_code == 422
+
+
 def test_submission_uses_configured_timeout_when_request_omits_it() -> None:
     request = DeepRunRequest(
         run_id="configured-timeout", user_id="user-1", agent_id="agent-1",
@@ -175,6 +228,51 @@ def test_run_emits_task_plan_updates(monkeypatch) -> None:
     assert len(plans) == 2
     assert plans[0]["tasks"][0]["status"] == "running"
     assert plans[-1]["tasks"][-1]["status"] == "completed"
+
+
+def test_tool_failure_emits_replanned_task_plan(monkeypatch) -> None:
+    settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+    send = AsyncMock()
+
+    async def execute_with_failure(_executor, _request, emit, _checkpointer):
+        await emit("tool.failed", {"toolName": "read_document", "error": "timeout"})
+        return ExecutionResult(content="Result", citations=[], model="test-model", tools=[], prompt_tokens=None, completion_tokens=None)
+
+    class FakeStore:
+        def __init__(self, _database_url) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            pass
+
+        async def create_if_absent(self, request):
+            return type("Record", (), {"run_id": request.run_id, "status": "QUEUED"})(), True
+
+        async def update(self, _run_id, _status, result=None, error=None) -> None:
+            pass
+
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", execute_with_failure)
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
+    monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
+    app = build_application(settings)
+    payload = {
+        "run_id": "replan-on-failure", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "task": "Summarize evidence.", "delegation_token": "token",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    with TestClient(app) as client:
+        response = client.post("/v1/runs", content=body, headers={
+            "X-Aether-Key-Id": settings.key_id,
+            "X-Aether-Timestamp": timestamp,
+            "X-Aether-Signature": build_signature(settings.shared_secret, timestamp, body),
+            "Content-Type": "application/json",
+        })
+        assert response.status_code == 202
+        client.portal.call(asyncio.sleep, 0.05)
+
+    plans = [call.args[2] for call in send.await_args_list if call.args[1] == "plan.updated"]
+    assert [plan["reason"] for plan in plans] == ["INITIAL", "STEP_FAILED", "COMPLETED"]
 
 
 def test_run_completed_callback_failure_does_not_change_successful_status(monkeypatch) -> None:
