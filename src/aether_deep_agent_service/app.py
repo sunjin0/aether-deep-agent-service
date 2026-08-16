@@ -182,7 +182,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         })
 
     async def run(request: DeepRunRequest, pending: PendingApproval | PendingUserQuestion | None = None,
-                  decisions: list[dict] | None = None, skip_plan: bool = False) -> None:
+                  decisions: list[dict] | None = None, skip_plan: bool = False, plan_approved: bool = False) -> None:
         task_plan = task_plans.get(request.run_id, [])
         # The in-memory task plan is merely a delivery cache. Restore the latest
         # durable projection after a service restart so resume/completion does
@@ -243,6 +243,11 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                     await store.save_interaction(request.run_id, "plan_approval", {"plan": task_plan})
                     await safe_callback(request.run_id, "plan.approval.required", {"plan": task_plan})
                     return
+                result = await executor.execute(request, emit_runtime_event, checkpointer)
+            elif plan_approved:
+                # 计划已批准：计划审批门是 Python 层暂停，图上没有检查点，
+                # 因此这里直接开始执行（用已批准的计划），而不是 continue_from_checkpoint。
+                await publish_plan("RESUME", "计划已批准，开始执行", task_plan or [])
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None:
                 if task_plan:
@@ -392,10 +397,10 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             tasks[run_id] = asyncio.create_task(run(pending.request, pending, payload.decisions))
             return {"runId": run_id, "status": "RUNNING"}
         if interaction is not None and interaction.interaction_type == "plan_approval":
-            # 计划已确认：从最近检查点继续执行（skip_plan 避免重新规划）。
+            # 计划已批准：审批门是 Python 层暂停，图上无检查点，直接开始执行。
             resumed = DeepRunRequest.model_validate(record.request)
             await store.update(run_id, RunStatus.RUNNING)
-            tasks[run_id] = asyncio.create_task(run(resumed, skip_plan=True))
+            tasks[run_id] = asyncio.create_task(run(resumed, plan_approved=True))
             return {"runId": run_id, "status": "RUNNING"}
         if record.status == RunStatus.PAUSED:
             resumed = DeepRunRequest.model_validate(record.request)

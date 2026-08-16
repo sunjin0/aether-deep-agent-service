@@ -336,9 +336,9 @@ def test_resume_plan_approval_continues_execution(tmp_path, monkeypatch) -> None
         await store.engine.dispose()
 
         send = AsyncMock()
-        continue_from_checkpoint = AsyncMock(return_value=_result())
+        execute = AsyncMock(return_value=_result())
         monkeypatch.setattr(CallbackClient, "send_event", send)
-        monkeypatch.setattr(DeepAgentExecutor, "continue_from_checkpoint", continue_from_checkpoint)
+        monkeypatch.setattr(DeepAgentExecutor, "execute", execute)
 
         settings = _settings(url)
         app = build_application(settings)
@@ -348,6 +348,6 @@ def test_resume_plan_approval_continues_execution(tmp_path, monkeypatch) -> None
             await asyncio.sleep(0.3)
 
         assert response.json()["status"] == "RUNNING"
-        assert continue_from_checkpoint.await_count == 1  # 计划确认后从检查点继续
+        assert execute.await_count == 1  # 计划批准后直接开始执行（无图检查点）
 
     asyncio.run(scenario())
