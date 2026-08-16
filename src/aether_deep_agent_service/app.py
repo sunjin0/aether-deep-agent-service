@@ -238,6 +238,11 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                 await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
                 task_plan = await executor.plan(request)
                 await publish_plan("INITIAL", "Task plan created", task_plan)
+                # 计划先行：生成初始计划后暂停，等待用户确认再执行（Codex/Claude 风格）。
+                if request.plan_approval_required:
+                    await store.save_interaction(request.run_id, "plan_approval", {"plan": task_plan})
+                    await safe_callback(request.run_id, "plan.approval.required", {"plan": task_plan})
+                    return
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None:
                 if task_plan:
@@ -385,6 +390,12 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                 pending = PendingApproval(resumed, None, {}, None, actions, resumed.timeout_seconds or 0, "")
             await store.update(run_id, RunStatus.RUNNING)
             tasks[run_id] = asyncio.create_task(run(pending.request, pending, payload.decisions))
+            return {"runId": run_id, "status": "RUNNING"}
+        if interaction is not None and interaction.interaction_type == "plan_approval":
+            # 计划已确认：从最近检查点继续执行（skip_plan 避免重新规划）。
+            resumed = DeepRunRequest.model_validate(record.request)
+            await store.update(run_id, RunStatus.RUNNING)
+            tasks[run_id] = asyncio.create_task(run(resumed, skip_plan=True))
             return {"runId": run_id, "status": "RUNNING"}
         if record.status == RunStatus.PAUSED:
             resumed = DeepRunRequest.model_validate(record.request)

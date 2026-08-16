@@ -321,3 +321,33 @@ def test_resume_without_answers_resurfaces_ask_user(tmp_path, monkeypatch) -> No
         assert "ask_user.required" in event_types
 
     asyncio.run(scenario())
+
+
+def test_resume_plan_approval_continues_execution(tmp_path, monkeypatch) -> None:
+    """计划先行确认：用户确认计划后，从检查点继续执行。"""
+    async def scenario() -> None:
+        url = _db_url(tmp_path)
+        store = RunStore(url)
+        await store.initialize()
+        await store.create_if_absent(_deep_request(run_id="run-1"))
+        await store.save_interaction("run-1", "plan_approval", {
+            "plan": [{"title": "步骤一"}, {"title": "步骤二"}],
+        })
+        await store.engine.dispose()
+
+        send = AsyncMock()
+        continue_from_checkpoint = AsyncMock(return_value=_result())
+        monkeypatch.setattr(CallbackClient, "send_event", send)
+        monkeypatch.setattr(DeepAgentExecutor, "continue_from_checkpoint", continue_from_checkpoint)
+
+        settings = _settings(url)
+        app = build_application(settings)
+        async with app.router.lifespan_context(app):
+            response = await _post(app, settings, "/v1/runs/run-1/resume", {"plan_approved": True})
+            assert response.status_code == 202
+            await asyncio.sleep(0.3)
+
+        assert response.json()["status"] == "RUNNING"
+        assert continue_from_checkpoint.await_count == 1  # 计划确认后从检查点继续
+
+    asyncio.run(scenario())

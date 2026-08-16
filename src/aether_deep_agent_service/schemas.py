@@ -48,6 +48,8 @@ class DeepRunRequest(BaseModel):
     delegation_token: str = Field(min_length=1)
     tool_approval_policy: str = Field(default="ask", pattern="^(ask|risky|never)$")
     max_steps: int = Field(default=12, ge=1, le=50)
+    # 计划先行：生成初始计划后暂停等待用户确认，批准后才开始执行（Codex/Claude 风格）。
+    plan_approval_required: bool = False
     timeout_seconds: int | None = Field(default=None, ge=30, le=3600)
 
 
