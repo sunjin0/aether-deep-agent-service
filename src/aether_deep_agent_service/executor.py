@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import json
 import re
 import time
@@ -103,6 +104,22 @@ class RunTelemetryHandler(AsyncCallbackHandler):
             "toolCallId": str(run_id), "toolName": name, "arguments": input_str,
             "message": "Calling " + name,
         })
+        if name == "write_todos":
+            await self._emit_todos_update(input_str)
+
+    async def _emit_todos_update(self, input_str: str) -> None:
+        """write_todos 是模型最新的执行计划：以 todos.updated 事件驱动计划投影覆盖。
+
+        write_todos 的 input 可能是 JSON 双引号，也可能是 Python repr 单引号
+        （如 {'todos': [...]}），故用 ast.literal_eval 兼容两种形式。
+        """
+        try:
+            payload = ast.literal_eval(input_str) if input_str else {}
+            todos = payload.get("todos", []) if isinstance(payload, dict) else []
+            if isinstance(todos, list):
+                await self.emit("todos.updated", {"todos": todos})
+        except (ValueError, SyntaxError, AttributeError):
+            pass
 
     async def on_tool_end(self, output: Any, *, run_id: UUID, **_: Any) -> None:
         summary = str(output).replace("\n", " ")[:240]
@@ -244,19 +261,32 @@ class DeepAgentExecutor:
             })
         return result
 
-    async def plan_document(self, request: DeepRunRequest) -> tuple[bool, str]:
-        """生成规划文档（方案说明 + 复杂度判断），供用户审批。"""
+    async def plan_document(self, request: DeepRunRequest, feedback: str | None = None) -> tuple[bool, str]:
+        """生成规划文档（方案说明 + 复杂度判断），供用户审批。
+
+        feedback 非空时（方案反馈重规划）把用户意见并入任务描述，据以调整方案。
+        """
         try:
             model, base_url, api_key = await self._resolve_model(request)
         except Exception:
             return False, ""
+        task_text = request.task
+        if feedback:
+            task_text = f"{task_text}\n\n用户对方案的反馈（请据此修改方案）：\n{feedback}"
         prompt = (
-            "Write a concise plan document for the user's task. Return JSON only in this exact shape: "
-            '{"complex":<true|false>,"document":"<1-3 sentence plan document describing the approach, inputs and expected outcome>"}. '
+            "Analyze the user's task and return a JSON object with exactly this shape (no Markdown fence): "
+            '{"complex":<true|false>,"title":"<任务标题>","goal":"<交付物，一到两句>",'
+            '"background":"<已知信息、为什么采用此方案、约束；没有就留空>","approach":"<做法与理由、边界>",'
+            '"steps":["<具体步骤标题>","<具体步骤标题>",...],"risks":["<已知风险；没有就留空数组>"],'
+            '"acceptance":["<可验证的完成标准>"]}. '
             '"complex" must be true when the task needs a real multi-stage plan with tools or sub-steps, '
             "and false when it is a simple question the agent can answer directly. "
-            "The document must be a plan document (what will be done and why), not the final answer.\n\n"
-            f"User task:\n{request.task}"
+            "The plan is the approved execution contract shown to the user, NOT the final answer. "
+            "Write all text in the user's language and be concrete and specific to THIS task: "
+            "name the actual inputs, the actual dimensions to analyse and the actual deliverable. "
+            "\"steps\" must contain 1 to 6 real, concrete, ordered work items for this task "
+            "(not generic workflow phases); they are the execution checklist that will be carried out.\n\n"
+            f"User task:\n{task_text}"
         )
         try:
             planner = init_chat_model(model, use_responses_api=False, **self._model_kwargs(base_url, api_key))
@@ -275,12 +305,19 @@ class DeepAgentExecutor:
             return False, ""
 
     async def plan(self, request: DeepRunRequest) -> list[dict[str, str]]:
-        """审批通过后，根据已批准的规划文档生成可执行任务规划（步骤）。"""
+        """审批通过后，根据已批准的规划文档生成可执行任务规划（步骤）。
+
+        优先从文档「执行步骤」勾选清单解析步骤，保证文档与 tasks 一一对应（规范 §4）；
+        文档缺少步骤时回退到模型单独生成。
+        """
+        document = (request.task_state or {}).get("document") or ""
+        from_document = self._tasks_from_document(document)
+        if from_document:
+            return from_document
         try:
             model, base_url, api_key = await self._resolve_model(request)
         except Exception:
             return self._fallback_plan(request.task)
-        document = (request.task_state or {}).get("document") or ""
         prompt = (
             "Break the approved plan document into a concrete, ordered execution plan. "
             "Return JSON only in this exact shape: "
@@ -358,8 +395,27 @@ class DeepAgentExecutor:
         return tasks if len(tasks) >= 2 else DeepAgentExecutor._fallback_plan(task)
 
     @staticmethod
+    def _tasks_from_document(document: str) -> list[dict[str, str]]:
+        """从计划文档「执行步骤」勾选清单解析执行步骤，保证文档与 tasks 一一对应。"""
+        if not isinstance(document, str):
+            return []
+        tasks: list[dict[str, str]] = []
+        for line in document.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- [ ]"):
+                continue
+            title = re.sub(r"^-\s*\[\s*\]\s*(?:\d+\.\s*)?", "", stripped).strip()
+            if title:
+                tasks.append({"id": f"task-{len(tasks) + 1}", "title": title, "status": "pending"})
+        return tasks
+
+    @staticmethod
     def _parse_plan_document(content: Any) -> str:
-        """从计划 JSON 中解析方案文档（1-3 句 approach 说明）。"""
+        """从规划 JSON 的结构化字段拼装规范 §3 的 Markdown 方案文档。
+
+        模型只输出扁平 JSON（title/goal/steps 等），Markdown 由这里程序化生成，
+        避免模型在大 JSON 字符串内转义多行 Markdown 时产生非法 JSON。
+        """
         if not isinstance(content, str):
             return ""
         normalized = content.strip()
@@ -367,10 +423,43 @@ class DeepAgentExecutor:
             normalized = normalized.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         try:
             data = json.loads(normalized)
-            document = data.get("document") if isinstance(data, dict) else None
-            return str(document).strip() if document else ""
         except (json.JSONDecodeError, AttributeError):
             return ""
+        if not isinstance(data, dict):
+            return ""
+        title = str(data.get("title") or "").strip()
+        goal = str(data.get("goal") or "").strip()
+        background = str(data.get("background") or "").strip()
+        approach = str(data.get("approach") or "").strip()
+        raw_steps = data.get("steps")
+        steps = [str(s).strip() for s in raw_steps if str(s).strip()] if isinstance(raw_steps, list) else []
+        raw_risks = data.get("risks")
+        risks = [str(r).strip() for r in raw_risks if str(r).strip()] if isinstance(raw_risks, list) else []
+        raw_acceptance = data.get("acceptance")
+        acceptance = [str(a).strip() for a in raw_acceptance if str(a).strip()] if isinstance(raw_acceptance, list) else []
+
+        lines: list[str] = []
+        if title:
+            lines.append(f"# {title}")
+        if goal:
+            lines.append("## 目标")
+            lines.append(goal)
+        if background:
+            lines.append("## 背景")
+            lines.append(background)
+        if approach:
+            lines.append("## 方案")
+            lines.append(approach)
+        if steps:
+            lines.append("## 执行步骤")
+            lines.extend(f"- [ ] {index}. {step}" for index, step in enumerate(steps, start=1))
+        if risks:
+            lines.append("## 风险与注意")
+            lines.extend(f"- {risk}" for risk in risks)
+        if acceptance:
+            lines.append("## 验收标准")
+            lines.extend(f"- {item}" for item in acceptance)
+        return "\n".join(lines)
 
     @staticmethod
     def _parse_plan_complex(content: Any) -> bool:
@@ -525,8 +614,10 @@ class DeepAgentExecutor:
             checkpointer=checkpointer,
         )
         # 一次 MCP 工具调用至少包含模型决策、工具调用和结果归纳三个图节点。
-        # Java 配置 max_steps=1 时，原先的 4 次递归预算不足以完成这条最短链路。
-        recursion_limit = max(16, request.max_steps * 4)
+        # Java 配置 max_steps=1 时，原先的 4 次递归预算不足以完成这条最短链路；
+        # 多步骤计划（规范 §3 执行步骤）逐步骤执行会消耗更多图节点，按计划长度提升递归预算。
+        planned_steps = len((request.task_state or {}).get("plan") or [])
+        recursion_limit = max(32, request.max_steps * 4, planned_steps * 6)
         config = {
             "recursion_limit": recursion_limit,
             "callbacks": [telemetry],

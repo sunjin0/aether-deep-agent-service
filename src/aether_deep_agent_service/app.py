@@ -32,6 +32,28 @@ def update_task_plan(tasks: list[dict[str, str]], active_index: int | None = Non
     return result
 
 
+def todos_to_tasks(todos: list) -> list[dict[str, str]]:
+    """把 write_todos 的 todos（{content,status}，小写状态）映射为计划 tasks（大写状态）。
+
+    覆盖语义：最新一次 write_todos 就是模型当前的执行计划。
+    """
+    status_map = {"pending": "PENDING", "in_progress": "RUNNING", "completed": "COMPLETED"}
+    tasks: list[dict[str, str]] = []
+    for index, item in enumerate(todos, start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("content") or "").strip()
+        if not title:
+            continue
+        raw_status = str(item.get("status") or "pending").strip().lower()
+        tasks.append({
+            "id": f"todo-{index}",
+            "title": title,
+            "status": status_map.get(raw_status, "PENDING"),
+        })
+    return tasks
+
+
 def normalize_ask_user_payload(payload: dict) -> dict:
     """Normalize model-generated questions to selectable dashboard questions.
 
@@ -183,24 +205,36 @@ def build_application(settings: Settings | None = None) -> FastAPI:
 
     async def run(request: DeepRunRequest, pending: PendingApproval | PendingUserQuestion | None = None,
                   decisions: list[dict] | None = None, skip_plan: bool = False, plan_approved: bool = False,
-                  skip_analysis: bool = False) -> None:
+                  skip_analysis: bool = False, plan_feedback: str | None = None) -> None:
         task_plan = task_plans.get(request.run_id, [])
+        # write_todos 去重：仅当模型更新了 todos 才覆盖发布计划，避免每个计划步骤都产生新版本。
+        last_todos_json: str = ""
         # The in-memory task plan is merely a delivery cache. Restore the latest
         # durable projection after a service restart so resume/completion does
         # not discard the user's visible plan.
-        if not task_plan and hasattr(store, "latest_checkpoint"):
+        if hasattr(store, "latest_checkpoint"):
             checkpoint = await store.latest_checkpoint(request.run_id)
-            checkpoint_tasks = checkpoint.state.get("tasks") if checkpoint is not None and isinstance(checkpoint.state, dict) else None
-            if isinstance(checkpoint_tasks, list):
-                task_plan = [dict(item) for item in checkpoint_tasks if isinstance(item, dict)]
-                if task_plan:
-                    task_plans[request.run_id] = task_plan
-                    request.task_state["plan"] = task_plan
-                    request.task_state["plan_reason"] = checkpoint.state.get("planReason", "RESUME")
+            if checkpoint is not None and isinstance(checkpoint.state, dict):
+                # 方案文档与复杂度始终从 checkpoint 恢复，保证审批/重启后发布的
+                # RESUME 计划仍携带规范 §3 文档与正确的复杂度判断。
+                if checkpoint.state.get("document"):
+                    request.task_state["document"] = checkpoint.state["document"]
+                if "complex" in checkpoint.state:
+                    request.task_state["complex"] = checkpoint.state["complex"]
+                if not task_plan:
+                    checkpoint_tasks = checkpoint.state.get("tasks")
+                    if isinstance(checkpoint_tasks, list):
+                        task_plan = [dict(item) for item in checkpoint_tasks if isinstance(item, dict)]
+                        if task_plan:
+                            task_plans[request.run_id] = task_plan
+                            request.task_state["plan"] = task_plan
+                            request.task_state["plan_reason"] = checkpoint.state.get("planReason", "RESUME")
 
         async def publish_plan(reason: str, summary: str, plan: list[dict[str, str]],
-                               active_index: int | None = 0, completed: bool = False) -> None:
-            projected = update_task_plan(plan, active_index=active_index, completed=completed)
+                               active_index: int | None = 0, completed: bool = False,
+                               preserve_status: bool = False) -> None:
+            projected = ([dict(task) for task in plan]
+                         if preserve_status else update_task_plan(plan, active_index=active_index, completed=completed))
             task_plans[request.run_id] = projected
             request.task_state["plan"] = projected
             request.task_state["plan_reason"] = reason
@@ -210,6 +244,8 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                     "tasks": projected,
                     "currentStep": active_index or 0,
                     "planReason": reason,
+                    "document": (request.task_state or {}).get("document"),
+                    "complex": bool((request.task_state or {}).get("complex")),
                 })
             plan_payload: dict[str, object] = {
                 "reason": reason, "summary": summary, "maxSteps": request.max_steps,
@@ -220,8 +256,21 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             await safe_callback(request.run_id, "plan.updated", plan_payload)
 
         async def emit_runtime_event(event_type: str, data: dict) -> None:
-            nonlocal task_plan
+            nonlocal task_plan, last_todos_json
+            if event_type == "todos.updated":
+                # write_todos 是模型最新的执行计划：覆盖投影并发布 plan.updated（去重）。
+                synced = todos_to_tasks(data.get("todos") or [])
+                if synced:
+                    snapshot = json.dumps(synced, ensure_ascii=False)
+                    if snapshot != last_todos_json:
+                        last_todos_json = snapshot
+                        task_plan = synced
+                        await publish_plan("TOOL_RESULT", "已根据执行进度更新计划", synced, preserve_status=True)
+                return
             await safe_callback(request.run_id, event_type, data)
+            # write_todos 已由 todos.updated 分支同步计划，工具完成事件不再触发模型重规划。
+            if event_type in {"tool.completed", "tool.failed"} and data.get("toolName") == "write_todos":
+                return
             # Tool observations can change the viable path. Replan before the
             # graph decides its next action; the plan projection itself has no
             # authority to replay a side-effecting tool.
@@ -238,9 +287,21 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             if hasattr(store, "checkpoint"):
                 await store.checkpoint(request.run_id, {"phase": "running", "task": request.task})
         try:
-            if plan_approved:
-                # 规划文档已批准：根据文档生成任务规划（步骤）并开始执行。
+            if plan_feedback:
+                # 用户反馈方案：按反馈重新生成方案文档与步骤，重新提交审批（再次批准后才执行）。
+                complex_task, document = await executor.plan_document(request, feedback=plan_feedback)
                 task_plan = await executor.plan(request)
+                await publish_plan("USER_INPUT", "已根据用户反馈调整方案", task_plan)
+                approval_payload: dict[str, object] = {"complex": bool(complex_task), "plan": task_plan}
+                if document:
+                    approval_payload["document"] = document
+                await store.save_interaction(request.run_id, "plan_approval", approval_payload)
+                await safe_callback(request.run_id, "plan.approval.required", approval_payload)
+                return
+            if plan_approved:
+                # 规划文档已批准：复用已发布/已检查点的任务规划，避免重新生成与审批结果不一致的步骤。
+                if not task_plan:
+                    task_plan = await executor.plan(request)
                 await publish_plan("RESUME", "规划文档已批准，生成任务规划", task_plan)
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None and not skip_plan:
@@ -255,18 +316,18 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                             normalize_ask_user_payload({"question": "开始前请先补充以下信息", "questions": missing}),
                         )
                         return
-                # 先生成规划文档（方案说明）供审批；审批通过后才划分任务规划。
+                # 先生成规划文档（方案说明 + 步骤），先发布 INITIAL 计划供展示；
+                # 复杂任务再暂停进入计划审批，审批通过后才开始执行。
                 complex_task, document = await executor.plan_document(request)
+                task_plan = await executor.plan(request)
+                await publish_plan("INITIAL", "Task plan created", task_plan)
                 if request.plan_approval_required and complex_task:
-                    approval_payload: dict[str, object] = {"complex": True}
+                    approval_payload: dict[str, object] = {"complex": True, "plan": task_plan}
                     if document:
                         approval_payload["document"] = document
                     await store.save_interaction(request.run_id, "plan_approval", approval_payload)
                     await safe_callback(request.run_id, "plan.approval.required", approval_payload)
                     return
-                # 简单任务：直接生成任务规划并执行。
-                task_plan = await executor.plan(request)
-                await publish_plan("INITIAL", "Task plan created", task_plan)
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None:
                 if task_plan:
@@ -422,10 +483,14 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             tasks[run_id] = asyncio.create_task(run(resumed, skip_analysis=True))
             return {"runId": run_id, "status": "RUNNING"}
         if interaction is not None and interaction.interaction_type == "plan_approval":
-            # 计划已批准：审批门是 Python 层暂停，图上无检查点，直接开始执行。
+            # 审批门是 Python 层暂停，图上无检查点。批准则直接开始执行；
+            # 携带方案反馈则按反馈重规划并重新提交审批。
             resumed = DeepRunRequest.model_validate(record.request)
             await store.update(run_id, RunStatus.RUNNING)
-            tasks[run_id] = asyncio.create_task(run(resumed, plan_approved=True))
+            if payload.plan_feedback:
+                tasks[run_id] = asyncio.create_task(run(resumed, plan_feedback=payload.plan_feedback))
+            else:
+                tasks[run_id] = asyncio.create_task(run(resumed, plan_approved=True))
             return {"runId": run_id, "status": "RUNNING"}
         if record.status == RunStatus.PAUSED:
             resumed = DeepRunRequest.model_validate(record.request)

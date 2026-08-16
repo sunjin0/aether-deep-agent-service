@@ -62,6 +62,7 @@ class DeepRunResponse(BaseModel):
 class ResumeRunRequest(BaseModel):
     decisions: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     answers: dict[str, Any] = Field(default_factory=dict)
+    plan_feedback: str | None = None
 
 
 class DeepRunStatusResponse(BaseModel):

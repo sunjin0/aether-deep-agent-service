@@ -1,6 +1,8 @@
+import json
+import uuid
 from types import SimpleNamespace
 
-from aether_deep_agent_service.executor import DeepAgentExecutor, ask_user
+from aether_deep_agent_service.executor import DeepAgentExecutor, RunTelemetryHandler, ask_user
 from aether_deep_agent_service.schemas import DeepRunRequest
 from aether_deep_agent_service.settings import Settings
 
@@ -181,14 +183,57 @@ async def test_emit_step_verifications_skips_without_plan() -> None:
 
 
 def test_parse_plan_document_and_complex() -> None:
-    content = (
-        '{"complex": true, "document": "先获取合同全文，再逐条分析风险并生成整改清单",'
-        '"tasks": [{"title": "获取合同"}, {"title": "分析风险"}]}'
+    content = json.dumps({
+        "complex": True,
+        "title": "分析合同高风险条款并生成整改清单",
+        "goal": "审查《采购合同》初稿，输出按风险等级排序的整改清单。",
+        "background": "用户已上传合同 PDF（共 12 页）。",
+        "approach": "分三段推进：抽取条款、按四维评估风险、汇总建议。",
+        "steps": ["抽取合同全部条款并编号", "按赔付、违约、知识产权、合规维度评估风险", "生成按风险等级排序的整改清单"],
+        "risks": ["违约金比例过高需单独提示"],
+        "acceptance": ["覆盖全部条款，高风险条款均有修改建议"],
+    }, ensure_ascii=False)
+    document = DeepAgentExecutor._parse_plan_document(content)
+    expected = (
+        "# 分析合同高风险条款并生成整改清单\n"
+        "## 目标\n审查《采购合同》初稿，输出按风险等级排序的整改清单。\n"
+        "## 背景\n用户已上传合同 PDF（共 12 页）。\n"
+        "## 方案\n分三段推进：抽取条款、按四维评估风险、汇总建议。\n"
+        "## 执行步骤\n"
+        "- [ ] 1. 抽取合同全部条款并编号\n"
+        "- [ ] 2. 按赔付、违约、知识产权、合规维度评估风险\n"
+        "- [ ] 3. 生成按风险等级排序的整改清单\n"
+        "## 风险与注意\n- 违约金比例过高需单独提示\n"
+        "## 验收标准\n- 覆盖全部条款，高风险条款均有修改建议"
     )
-    assert DeepAgentExecutor._parse_plan_document(content) == "先获取合同全文，再逐条分析风险并生成整改清单"
+    assert document == expected
     assert DeepAgentExecutor._parse_plan_complex(content) is True
     assert DeepAgentExecutor._parse_plan_complex('{"complex": false, "tasks": []}') is False
     assert DeepAgentExecutor._parse_plan_document("not json") == ""
+    assert DeepAgentExecutor._parse_plan_document('{"complex": true}') == ""
+
+
+def test_tasks_from_document_checklist() -> None:
+    document = (
+        "# 项目交付风险评估\n"
+        "## 执行步骤\n"
+        "- [ ] 1. 识别技术风险并制定应对策略\n"
+        "- [ ] 2. 识别进度风险并制定应对策略\n"
+        "- [ ] 3. 识别资源风险并制定应对策略\n"
+        "- [ ] 4. 汇总输出 Markdown 报告\n"
+        "## 验收标准\n报告覆盖三个维度。"
+    )
+    tasks = DeepAgentExecutor._tasks_from_document(document)
+    assert [t["title"] for t in tasks] == [
+        "识别技术风险并制定应对策略",
+        "识别进度风险并制定应对策略",
+        "识别资源风险并制定应对策略",
+        "汇总输出 Markdown 报告",
+    ]
+    assert tasks[0]["id"] == "task-1"
+    assert tasks[0]["status"] == "pending"
+    assert DeepAgentExecutor._tasks_from_document("no checklist here") == []
+    assert DeepAgentExecutor._tasks_from_document("") == []
 
 
 def test_parse_requirement_questions() -> None:
@@ -232,3 +277,37 @@ async def test_emit_step_verifications_falls_back_to_tool_outputs() -> None:
     assert emitted[0][1]["verification"] == "t1: 2026-08-16T10:00:00"
     assert emitted[1][1]["stepIndex"] == 2
     assert emitted[1][1]["verification"] == "t2: 2026-08-16T11:00:00"
+
+
+async def test_write_todos_emits_todos_update() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def capture(event_type: str, data: dict) -> None:
+        calls.append((event_type, data))
+
+    handler = RunTelemetryHandler(capture)
+    await handler.on_tool_start(
+        {"name": "write_todos"},
+        '{"todos": [{"content": "识别风险", "status": "pending"}, {"content": "输出报告", "status": "in_progress"}]}',
+        run_id=uuid.UUID(int=1),
+    )
+
+    todo_events = [c for c in calls if c[0] == "todos.updated"]
+    assert todo_events, f"expected todos.updated, got {calls}"
+    assert todo_events[0][1]["todos"][0]["content"] == "识别风险"
+    assert todo_events[0][1]["todos"][1]["status"] == "in_progress"
+    # 非 write_todos 工具不产生 todos.updated
+    calls.clear()
+    await handler.on_tool_start({"name": "get_current_time"}, "{}", run_id=uuid.UUID(int=2))
+    assert not [c for c in calls if c[0] == "todos.updated"]
+
+    # write_todos 的 input 也可能是 Python repr 单引号形式
+    calls.clear()
+    await handler.on_tool_start(
+        {"name": "write_todos"},
+        "{'todos': [{'content': '复核报告', 'status': 'in_progress'}]}",
+        run_id=uuid.UUID(int=3),
+    )
+    todo_events = [c for c in calls if c[0] == "todos.updated"]
+    assert todo_events
+    assert todo_events[0][1]["todos"][0]["content"] == "复核报告"

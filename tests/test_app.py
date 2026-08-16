@@ -581,3 +581,106 @@ def test_simple_plan_executes_without_approval(monkeypatch) -> None:
     assert execute.await_count == 1  # 单步计划直接执行
     event_types = [call.args[1] for call in send.await_args_list]
     assert "plan.approval.required" not in event_types
+
+
+def test_todos_to_tasks_maps_statuses_and_overwrites() -> None:
+    from aether_deep_agent_service.app import todos_to_tasks
+
+    tasks = todos_to_tasks([
+        {"content": "明确目标", "status": "pending"},
+        {"content": "识别风险", "status": "in_progress"},
+        {"content": "输出报告", "status": "completed"},
+    ])
+
+    assert [t["title"] for t in tasks] == ["明确目标", "识别风险", "输出报告"]
+    assert tasks[0]["status"] == "PENDING"
+    assert tasks[1]["status"] == "RUNNING"
+    assert tasks[2]["status"] == "COMPLETED"
+    assert tasks[0]["id"] == "todo-1"
+    assert todos_to_tasks([]) == []
+    assert todos_to_tasks("not a list") == []
+
+
+def test_plan_feedback_resume_replans_and_reapproves(monkeypatch) -> None:
+    settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+
+    class FakeStore:
+        def __init__(self, _database_url) -> None:
+            self.interactions: dict[str, tuple[str, dict]] = {}
+            self.records: dict[str, object] = {}
+
+        async def initialize(self) -> None:
+            pass
+
+        async def create_if_absent(self, request):
+            rec = type("Record", (), {
+                "run_id": request.run_id, "status": "QUEUED",
+                "request": request.model_dump(mode="json"),
+            })()
+            self.records[request.run_id] = rec
+            return rec, True
+
+        async def update(self, _run_id, _status, result=None, error=None) -> None:
+            pass
+
+        async def save_interaction(self, run_id, interaction_type, payload) -> None:
+            self.interactions[run_id] = (interaction_type, payload)
+
+        async def take_interaction(self, run_id):
+            item = self.interactions.pop(run_id, None)
+            if item is None:
+                return None
+            return type("I", (), {"interaction_type": item[0], "payload": item[1]})()
+
+        async def get(self, run_id):
+            return self.records.get(run_id)
+
+        async def latest_checkpoint(self, run_id):
+            return None
+
+    send = AsyncMock()
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan_document",
+                        AsyncMock(return_value=(True, "简化后的方案")))
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan",
+                        AsyncMock(return_value=[{"id": "task-1", "title": "合并后的步骤", "status": "pending"}]))
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", AsyncMock())
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
+    monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
+
+    app = build_application(settings)
+    payload = {
+        "run_id": "plan-fb", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "task": "分析合同风险", "delegation_token": "token",
+        "plan_approval_required": True,
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    headers = {
+        "X-Aether-Key-Id": settings.key_id,
+        "X-Aether-Timestamp": timestamp,
+        "X-Aether-Signature": build_signature(settings.shared_secret, timestamp, body),
+        "Content-Type": "application/json",
+    }
+    with TestClient(app) as client:
+        response = client.post("/v1/runs", content=body, headers=headers)
+        assert response.status_code == 202
+        client.portal.call(asyncio.sleep, 0.2)
+
+    send.reset_mock()
+    feedback = json.dumps({"plan_feedback": "简化步骤，合并为3步"}, separators=(",", ":")).encode("utf-8")
+    ts2 = str(int(time.time()))
+    headers2 = {
+        "X-Aether-Key-Id": settings.key_id,
+        "X-Aether-Timestamp": ts2,
+        "X-Aether-Signature": build_signature(settings.shared_secret, ts2, feedback),
+        "Content-Type": "application/json",
+    }
+    with TestClient(app) as client:
+        response = client.post("/v1/runs/plan-fb/resume", content=feedback, headers=headers2)
+        assert response.status_code == 202
+        client.portal.call(asyncio.sleep, 0.2)
+
+    event_types = [call.args[1] for call in send.await_args_list]
+    assert "plan.approval.required" in event_types, f"feedback should re-present approval, got {event_types}"
+    plan_updated = [call.args[2] for call in send.await_args_list if call.args[1] == "plan.updated"]
+    assert any(p.get("reason") == "USER_INPUT" for p in plan_updated), plan_updated
