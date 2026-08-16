@@ -182,7 +182,8 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         })
 
     async def run(request: DeepRunRequest, pending: PendingApproval | PendingUserQuestion | None = None,
-                  decisions: list[dict] | None = None, skip_plan: bool = False, plan_approved: bool = False) -> None:
+                  decisions: list[dict] | None = None, skip_plan: bool = False, plan_approved: bool = False,
+                  skip_analysis: bool = False) -> None:
         task_plan = task_plans.get(request.run_id, [])
         # The in-memory task plan is merely a delivery cache. Restore the latest
         # durable projection after a service restart so resume/completion does
@@ -244,6 +245,16 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None and not skip_plan:
                 await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
+                # 需求分析：先检查用户问题是否信息完整，缺失则让用户补充，不盲目生成规划。
+                if not skip_analysis:
+                    missing = await executor.analyze_requirements(request)
+                    if missing:
+                        await store.save_interaction(request.run_id, "requirement_analysis", {"questions": missing})
+                        await safe_callback(
+                            request.run_id, "ask_user.required",
+                            normalize_ask_user_payload({"question": "开始前请先补充以下信息", "questions": missing}),
+                        )
+                        return
                 task_plan = await executor.plan(request)
                 await publish_plan("INITIAL", "Task plan created", task_plan)
                 # 计划先行：仅对复杂问题的任务规划（>=3 步）暂停等待用户确认；
@@ -403,6 +414,12 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                 pending = PendingApproval(resumed, None, {}, None, actions, resumed.timeout_seconds or 0, "")
             await store.update(run_id, RunStatus.RUNNING)
             tasks[run_id] = asyncio.create_task(run(pending.request, pending, payload.decisions))
+            return {"runId": run_id, "status": "RUNNING"}
+        if interaction is not None and interaction.interaction_type == "requirement_analysis":
+            # 用户已补充需求分析缺的信息：跳过分析，继续生成规划。
+            resumed = DeepRunRequest.model_validate(record.request)
+            await store.update(run_id, RunStatus.RUNNING)
+            tasks[run_id] = asyncio.create_task(run(resumed, skip_analysis=True))
             return {"runId": run_id, "status": "RUNNING"}
         if interaction is not None and interaction.interaction_type == "plan_approval":
             # 计划已批准：审批门是 Python 层暂停，图上无检查点，直接开始执行。

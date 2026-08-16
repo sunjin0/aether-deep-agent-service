@@ -163,6 +163,73 @@ class DeepAgentExecutor:
             kwargs["api_key"] = api_key
         return kwargs
 
+    async def analyze_requirements(self, request: DeepRunRequest) -> list[dict[str, Any]]:
+        """规划前分析用户问题是否信息完整，返回需要补充的提问（空列表=信息完整）。
+
+        缺失信息时先让用户补充，避免拿到不完整请求就盲目生成规划。
+        """
+        try:
+            model, base_url, api_key = await self._resolve_model(request)
+        except Exception:
+            return []
+        prompt = (
+            "Analyze whether the user's request is complete and actionable. "
+            "Return JSON only in this exact shape: "
+            '{"questions":[{"id":"...","question":"...","options":[{"value":"...","label":"..."}]}]}. '
+            "Return an empty questions array when the request is complete. "
+            "Only ask for information that is genuinely required and cannot be derived from the request "
+            "or the supplied evidence. Do not ask how to answer; ask only for missing inputs.\n\n"
+            f"User task:\n{request.task}\n\n"
+            f"Available evidence:\n{self._source_context(request)}"
+        )
+        try:
+            planner = init_chat_model(model, use_responses_api=False, **self._model_kwargs(base_url, api_key))
+            response = await asyncio.wait_for(
+                planner.ainvoke([{"role": "user", "content": prompt}]),
+                timeout=min(request.timeout_seconds or self.settings.run_timeout_seconds, 30),
+            )
+            return self._parse_requirement_questions(getattr(response, "content", ""))
+        except Exception:
+            return []
+
+    @staticmethod
+    def _parse_requirement_questions(content: Any) -> list[dict[str, Any]]:
+        if not isinstance(content, str):
+            return []
+        normalized = content.strip()
+        if normalized.startswith("```"):
+            normalized = normalized.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            data = json.loads(normalized)
+            questions = data.get("questions") if isinstance(data, dict) else None
+        except (json.JSONDecodeError, AttributeError):
+            return []
+        result: list[dict[str, Any]] = []
+        if not isinstance(questions, list):
+            return result
+        for index, raw in enumerate(questions[:4]):
+            if not isinstance(raw, dict) or not str(raw.get("question") or "").strip():
+                continue
+            options = []
+            for i, option in enumerate(raw.get("options") or []):
+                if isinstance(option, dict):
+                    value = str(option.get("value") or option.get("id") or f"option_{i + 1}")
+                    label = str(option.get("label") or option.get("text") or option.get("name") or value)
+                    options.append({"value": value, "label": label})
+            if not options:
+                options = [
+                    {"value": "provide_details", "label": "提供具体信息"},
+                    {"value": "not_available", "label": "暂无相关信息"},
+                ]
+            result.append({
+                "id": str(raw.get("id") or f"question_{index + 1}"),
+                "question": str(raw["question"]).strip(),
+                "options": options,
+                "multiple": bool(raw.get("multiple")),
+                "allowCustomInput": True,
+            })
+        return result
+
     async def plan(self, request: DeepRunRequest) -> list[dict[str, str]]:
         """Use the configured model to turn the user's request into an executable task plan."""
         try:
@@ -471,6 +538,8 @@ class DeepAgentExecutor:
         # 模型偶尔会把要求的全角引用【1】输出为半角[1]。在持久化前统一格式，
         # 以保证 Java 的引用审计和 Dashboard 的来源锚点使用同一个编号。
         content = self._normalize_citation_format(content)
+        # 移除计划契约的 [STEP_VERIFIED] 验证标记，避免泄漏到最终回复。
+        content = self._strip_step_verified(content)
         citations = [source.model_dump() for source in request.knowledge_sources if source.citation in content]
         return ExecutionResult(
             content=content,
@@ -480,6 +549,12 @@ class DeepAgentExecutor:
             prompt_tokens=telemetry.prompt_tokens,
             completion_tokens=telemetry.completion_tokens,
         )
+
+    @staticmethod
+    def _strip_step_verified(content: str) -> str:
+        lines = [line for line in content.splitlines()
+                 if not re.match(r"^\s*\[STEP_VERIFIED\]", line, re.IGNORECASE)]
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _normalize_citation_format(content: str) -> str:

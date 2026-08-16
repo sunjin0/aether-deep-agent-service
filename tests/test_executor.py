@@ -191,6 +191,19 @@ def test_parse_plan_document_and_complex() -> None:
     assert DeepAgentExecutor._parse_plan_document("not json") == ""
 
 
+def test_parse_requirement_questions() -> None:
+    content = (
+        '{"questions":[{"id":"target","question":"目标文档？",'
+        '"options":[{"value":"doc_a","label":"文档A"}]}]}'
+    )
+    questions = DeepAgentExecutor._parse_requirement_questions(content)
+    assert len(questions) == 1
+    assert questions[0]["id"] == "target"
+    assert questions[0]["options"][0]["label"] == "文档A"
+    assert DeepAgentExecutor._parse_requirement_questions('{"questions": []}') == []
+    assert DeepAgentExecutor._parse_requirement_questions("not json") == []
+
+
 async def test_emit_step_verifications_falls_back_to_tool_outputs() -> None:
     executor = DeepAgentExecutor(Settings())
     request = DeepRunRequest(

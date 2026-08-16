@@ -426,6 +426,109 @@ def test_plan_approval_gate_waits_for_complex_plan(monkeypatch) -> None:
     assert "plan.approval.required" in event_types
 
 
+def test_requirement_analysis_asks_user_before_planning(monkeypatch) -> None:
+    """需求分析发现信息缺失时先 ask_user 补充，不生成规划。"""
+    settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+    execute = AsyncMock(return_value=ExecutionResult(
+        content="Result", citations=[], model="test-model", tools=[], prompt_tokens=None, completion_tokens=None,
+    ))
+    send = AsyncMock()
+    plan = AsyncMock(side_effect=AssertionError("plan must not run before supplement"))
+
+    class FakeStore:
+        def __init__(self, _database_url) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            pass
+
+        async def create_if_absent(self, request):
+            return type("Record", (), {"run_id": request.run_id, "status": "QUEUED"})(), True
+
+        async def update(self, _run_id, _status, result=None, error=None) -> None:
+            pass
+
+        async def save_interaction(self, _run_id, _interaction_type, _payload) -> None:
+            pass
+
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.analyze_requirements",
+                        AsyncMock(return_value=[{"id": "target", "question": "目标文档？", "options": [{"value": "a", "label": "A"}]}]))
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan", plan)
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", execute)
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
+    monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
+
+    app = build_application(settings)
+    payload = {
+        "run_id": "req-analysis", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "task": "分析合同", "delegation_token": "token",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    with TestClient(app) as client:
+        response = client.post("/v1/runs", content=body, headers={
+            "X-Aether-Key-Id": settings.key_id,
+            "X-Aether-Timestamp": timestamp,
+            "X-Aether-Signature": build_signature(settings.shared_secret, timestamp, body),
+            "Content-Type": "application/json",
+        })
+        assert response.status_code == 202
+        client.portal.call(asyncio.sleep, 0.2)
+
+    assert execute.await_count == 0
+    event_types = [call.args[1] for call in send.await_args_list]
+    assert "ask_user.required" in event_types
+
+
+def test_complete_requirement_proceeds_to_planning(monkeypatch) -> None:
+    """需求分析无缺失信息时继续生成规划并执行。"""
+    settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+    execute = AsyncMock(return_value=ExecutionResult(
+        content="Result", citations=[], model="test-model", tools=[], prompt_tokens=None, completion_tokens=None,
+    ))
+    send = AsyncMock()
+
+    class FakeStore:
+        def __init__(self, _database_url) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            pass
+
+        async def create_if_absent(self, request):
+            return type("Record", (), {"run_id": request.run_id, "status": "QUEUED"})(), True
+
+        async def update(self, _run_id, _status, result=None, error=None) -> None:
+            pass
+
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.analyze_requirements",
+                        AsyncMock(return_value=[]))
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan",
+                        AsyncMock(return_value=[{"title": "步骤一"}]))
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", execute)
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
+    monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
+
+    app = build_application(settings)
+    payload = {
+        "run_id": "req-complete", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "task": "获取当前时间", "delegation_token": "token",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    with TestClient(app) as client:
+        response = client.post("/v1/runs", content=body, headers={
+            "X-Aether-Key-Id": settings.key_id,
+            "X-Aether-Timestamp": timestamp,
+            "X-Aether-Signature": build_signature(settings.shared_secret, timestamp, body),
+            "Content-Type": "application/json",
+        })
+        assert response.status_code == 202
+        client.portal.call(asyncio.sleep, 0.2)
+
+    assert execute.await_count == 1
+
+
 def test_simple_plan_executes_without_approval(monkeypatch) -> None:
     """单步简单计划即使 plan_approval_required 也直接执行，不需要审批。"""
     settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
