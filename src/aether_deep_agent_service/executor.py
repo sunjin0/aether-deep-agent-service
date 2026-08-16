@@ -261,13 +261,36 @@ class DeepAgentExecutor:
     async def execute(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
         agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
         state = await asyncio.wait_for(agent.ainvoke({"messages": self._initial_messages(request)}, config=config), timeout=request.timeout_seconds)
+        await self._emit_step_verifications(state, request, emit)
         return self._result_or_pending(state, request, agent, config, telemetry, model)
 
     async def continue_from_checkpoint(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
         """Resume a paused graph from LangGraph's durable thread checkpoint."""
         agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
         state = await asyncio.wait_for(agent.ainvoke(None, config=config), timeout=request.timeout_seconds)
+        await self._emit_step_verifications(state, request, emit)
         return self._result_or_pending(state, request, agent, config, telemetry, model)
+
+    async def _emit_step_verifications(self, state: dict[str, Any], request: DeepRunRequest, emit: EventSink) -> None:
+        """把模型按计划契约输出的 [STEP_VERIFIED] 验证结论投影为 step.verified 事件。"""
+        plan = (request.task_state or {}).get("plan")
+        if not isinstance(plan, list) or not plan:
+            return
+        messages = state.get("messages", [])
+        if not messages:
+            return
+        content = getattr(messages[-1], "content", "")
+        if not isinstance(content, str):
+            return
+        markers = re.findall(r"\[STEP_VERIFIED\]\s*(.+)", content, re.IGNORECASE)
+        for index, verification in enumerate(markers[: len(plan)]):
+            step = plan[index]
+            await emit("step.verified", {
+                "stepId": step.get("id") or f"step-{index + 1}",
+                "stepIndex": index + 1,
+                "title": step.get("title") or f"步骤 {index + 1}",
+                "verification": verification.strip()[:500],
+            })
 
     async def resume(self, request: DeepRunRequest, decisions: list[dict[str, Any]], emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
         """Rebuild the graph and use the durable thread state to resolve an interrupt."""
@@ -300,6 +323,18 @@ class DeepAgentExecutor:
                 "\n\nCurrent durable task state (a concise execution projection, not hidden reasoning):\n"
                 + json.dumps(request.task_state, ensure_ascii=False)
                 + "\nUse verified tool results to adjust the next action; do not repeat completed work."
+            )
+        plan_steps = (request.task_state or {}).get("plan")
+        if isinstance(plan_steps, list) and plan_steps:
+            # 计划是执行契约：按序执行、逐步验证，输出结构化验证标记。
+            numbered = "\n".join(f"{i + 1}. {step.get('title')}" for i, step in enumerate(plan_steps))
+            instructions += (
+                "\n\nExecution plan — you MUST follow these steps IN ORDER. "
+                "Complete each step's goal before moving to the next; use tools when needed. "
+                "After finishing a step, output a verification line exactly as:\n"
+                "[STEP_VERIFIED] <verification summary of this step>\n"
+                "Do not skip steps, do not repeat completed work, and do not claim a step is done without verifying its output.\n"
+                f"Steps:\n{numbered}"
             )
         tools = await self._load_mcp_tools(request)
         tools.append(ask_user)

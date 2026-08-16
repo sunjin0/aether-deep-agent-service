@@ -136,3 +136,45 @@ async def test_resolve_model_prefixes_admin_provider_model(monkeypatch) -> None:
     assert model == "openai:deepseek-v4-flash"  # Admin 的 OpenAI 兼容 provider 需补充前缀
     assert base_url == "https://api.deepseek.com"
     assert api_key == "secret"
+
+
+async def test_emit_step_verifications_parses_contract_markers() -> None:
+    executor = DeepAgentExecutor(Settings())
+    request = DeepRunRequest(
+        run_id="run-1", user_id="user-1", agent_id="agent-1", conversation_id="conversation-1",
+        task="t", delegation_token="tok",
+        task_state={"plan": [{"title": "提取条款"}, {"title": "分析风险"}]},
+    )
+    emitted: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, data: dict) -> None:
+        emitted.append((event_type, data))
+
+    state = {"messages": [type("Msg", (), {"content": (
+        "第一步完成。\n[STEP_VERIFIED] 已提取关键条款\n"
+        "第二步完成。\n[STEP_VERIFIED] 已按风险等级汇总\n"
+    )})()]}
+
+    await executor._emit_step_verifications(state, request, emit)
+
+    assert [e[0] for e in emitted] == ["step.verified", "step.verified"]
+    assert emitted[0][1]["stepIndex"] == 1
+    assert emitted[0][1]["verification"] == "已提取关键条款"
+    assert emitted[1][1]["stepIndex"] == 2
+    assert emitted[1][1]["verification"] == "已按风险等级汇总"
+
+
+async def test_emit_step_verifications_skips_without_plan() -> None:
+    executor = DeepAgentExecutor(Settings())
+    request = DeepRunRequest(
+        run_id="run-1", user_id="user-1", agent_id="agent-1", conversation_id="conversation-1",
+        task="t", delegation_token="tok",
+    )
+    emitted: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, data: dict) -> None:
+        emitted.append((event_type, data))
+
+    await executor._emit_step_verifications({"messages": [type("Msg", (), {"content": "[STEP_VERIFIED] x"})()]}, request, emit)
+
+    assert emitted == []
