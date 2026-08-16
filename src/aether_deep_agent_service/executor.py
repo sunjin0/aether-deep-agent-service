@@ -171,7 +171,9 @@ class DeepAgentExecutor:
             return self._fallback_plan(request.task)
         prompt = (
             "Create a concise execution plan for the user's task. Return JSON only in this exact shape: "
-            '{"tasks":[{"title":"..."}]}. Generate 3 to 6 concrete, ordered steps. '
+            '{"tasks":[{"title":"..."}]}. Generate 1 to 6 concrete, ordered steps, '
+            "proportionate to the task's complexity: a trivial task needs 1 step, "
+            "while a multi-stage task may need more. "
             "Each title must describe work needed for this specific task; do not use generic workflow phases. "
             "Do not answer the task itself and do not mention unavailable tools.\n\n"
             f"User task:\n{request.task}"

@@ -398,7 +398,7 @@ def test_plan_approval_gate_waits_for_complex_plan(monkeypatch) -> None:
             pass
 
     monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan",
-                        AsyncMock(return_value=[{"title": "步骤一"}, {"title": "步骤二"}]))
+                        AsyncMock(return_value=[{"title": "步骤一"}, {"title": "步骤二"}, {"title": "步骤三"}]))
     monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", execute)
     monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
     monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
