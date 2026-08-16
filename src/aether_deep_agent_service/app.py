@@ -239,9 +239,9 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                 await store.checkpoint(request.run_id, {"phase": "running", "task": request.task})
         try:
             if plan_approved:
-                # 计划已批准：审批门是 Python 层暂停，图上无检查点，
-                # 直接用已批准的计划开始执行，避免再次规划/审批。
-                await publish_plan("RESUME", "计划已批准，开始执行", task_plan or [])
+                # 规划文档已批准：根据文档生成任务规划（步骤）并开始执行。
+                task_plan = await executor.plan(request)
+                await publish_plan("RESUME", "规划文档已批准，生成任务规划", task_plan)
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None and not skip_plan:
                 await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
@@ -255,18 +255,18 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                             normalize_ask_user_payload({"question": "开始前请先补充以下信息", "questions": missing}),
                         )
                         return
-                task_plan = await executor.plan(request)
-                await publish_plan("INITIAL", "Task plan created", task_plan)
-                # 计划先行：仅对复杂问题的任务规划（>=3 步）暂停等待用户确认；
-                # 简单任务直接执行（Codex/Claude 风格）。
-                complex_task = bool((request.task_state or {}).get("complex"))
+                # 先生成规划文档（方案说明）供审批；审批通过后才划分任务规划。
+                complex_task, document = await executor.plan_document(request)
                 if request.plan_approval_required and complex_task:
-                    approval_payload: dict[str, object] = {"plan": task_plan, "complex": True}
-                    if (request.task_state or {}).get("document"):
-                        approval_payload["document"] = request.task_state["document"]
+                    approval_payload: dict[str, object] = {"complex": True}
+                    if document:
+                        approval_payload["document"] = document
                     await store.save_interaction(request.run_id, "plan_approval", approval_payload)
                     await safe_callback(request.run_id, "plan.approval.required", approval_payload)
                     return
+                # 简单任务：直接生成任务规划并执行。
+                task_plan = await executor.plan(request)
+                await publish_plan("INITIAL", "Task plan created", task_plan)
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None:
                 if task_plan:

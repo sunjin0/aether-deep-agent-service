@@ -22,6 +22,13 @@ from .settings import Settings
 
 EventSink = Callable[[str, dict[str, Any]], Awaitable[None]]
 
+# 简单寒暄/自我介绍问题不走 ask_user 需求分析。
+_SIMPLE_GREETING = re.compile(
+    r"(你好|您好|在吗|你是谁|你是什么|你能干啥|你会什么|你能做什么|你有哪些功能|"
+    r"^hi\b|^hello\b|^hey\b|谢谢|再见|你好吗)",
+    re.IGNORECASE,
+)
+
 
 class AskUserOption(BaseModel):
     """A selectable answer exposed in the chat interaction card."""
@@ -167,7 +174,10 @@ class DeepAgentExecutor:
         """规划前分析用户问题是否信息完整，返回需要补充的提问（空列表=信息完整）。
 
         缺失信息时先让用户补充，避免拿到不完整请求就盲目生成规划。
+        简单寒暄/自我介绍问题不走 ask_user，直接进入回答。
         """
+        if _SIMPLE_GREETING.search(request.task or ""):
+            return []
         try:
             model, base_url, api_key = await self._resolve_model(request)
         except Exception:
@@ -175,10 +185,13 @@ class DeepAgentExecutor:
         prompt = (
             "Analyze whether the user's request is complete and actionable. "
             "Return JSON only in this exact shape: "
-            '{"questions":[{"id":"...","question":"...","options":[{"value":"...","label":"..."}]}]}. '
+            '{"questions":[{"id":"...","question":"...","options":[{"value":"...","label":"...","recommended":true|false}]}]}. '
             "Return an empty questions array when the request is complete. "
             "Only ask for information that is genuinely required and cannot be derived from the request "
-            "or the supplied evidence. Do not ask how to answer; ask only for missing inputs.\n\n"
+            "or the supplied evidence. Do not ask how to answer; ask only for missing inputs. "
+            "For each question, provide 2-4 concrete, domain-specific options based on the request context "
+            "(e.g. '科技计划', '科研项目', '专项资金'), and mark the most likely one with \"recommended\": true. "
+            "Do not use generic placeholders such as '提供具体信息' or '暂无相关信息'.\n\n"
             f"User task:\n{request.task}\n\n"
             f"Available evidence:\n{self._source_context(request)}"
         )
@@ -215,12 +228,13 @@ class DeepAgentExecutor:
                 if isinstance(option, dict):
                     value = str(option.get("value") or option.get("id") or f"option_{i + 1}")
                     label = str(option.get("label") or option.get("text") or option.get("name") or value)
-                    options.append({"value": value, "label": label})
+                    option_item: dict[str, Any] = {"value": value, "label": label}
+                    if option.get("recommended"):
+                        option_item["recommended"] = True
+                    options.append(option_item)
             if not options:
-                options = [
-                    {"value": "provide_details", "label": "提供具体信息"},
-                    {"value": "not_available", "label": "暂无相关信息"},
-                ]
+                # 模型未给出具体选项时，仅提供一个允许用户直接输入的自定义选项。
+                options = [{"value": "provide_details", "label": "由用户提供", "recommended": True}]
             result.append({
                 "id": str(raw.get("id") or f"question_{index + 1}"),
                 "question": str(raw["question"]).strip(),
@@ -230,23 +244,18 @@ class DeepAgentExecutor:
             })
         return result
 
-    async def plan(self, request: DeepRunRequest) -> list[dict[str, str]]:
-        """Use the configured model to turn the user's request into an executable task plan."""
+    async def plan_document(self, request: DeepRunRequest) -> tuple[bool, str]:
+        """生成规划文档（方案说明 + 复杂度判断），供用户审批。"""
         try:
             model, base_url, api_key = await self._resolve_model(request)
         except Exception:
-            return self._fallback_plan(request.task)
+            return False, ""
         prompt = (
-            "Create a concise execution plan document for the user's task. Return JSON only in this exact shape: "
-            '{"complex":<true|false>,"document":"<1-3 sentence plan document describing the approach, inputs and expected outcome>",'
-            '"tasks":[{"title":"..."}]}. '
+            "Write a concise plan document for the user's task. Return JSON only in this exact shape: "
+            '{"complex":<true|false>,"document":"<1-3 sentence plan document describing the approach, inputs and expected outcome>"}. '
             '"complex" must be true when the task needs a real multi-stage plan with tools or sub-steps, '
             "and false when it is a simple question the agent can answer directly. "
-            "Generate 1 to 6 concrete, ordered steps, "
-            "proportionate to the task's complexity: a trivial task needs 1 step, "
-            "while a multi-stage task may need more. "
-            "Each title must describe work needed for this specific task; do not use generic workflow phases. "
-            "Do not answer the task itself and do not mention unavailable tools.\n\n"
+            "The document must be a plan document (what will be done and why), not the final answer.\n\n"
             f"User task:\n{request.task}"
         )
         try:
@@ -261,7 +270,34 @@ class DeepAgentExecutor:
                 if document:
                     request.task_state["document"] = document
                 request.task_state["complex"] = self._parse_plan_complex(content)
-            return self._parse_plan(content, request.task)
+            return self._parse_plan_complex(content), self._parse_plan_document(content)
+        except Exception:
+            return False, ""
+
+    async def plan(self, request: DeepRunRequest) -> list[dict[str, str]]:
+        """审批通过后，根据已批准的规划文档生成可执行任务规划（步骤）。"""
+        try:
+            model, base_url, api_key = await self._resolve_model(request)
+        except Exception:
+            return self._fallback_plan(request.task)
+        document = (request.task_state or {}).get("document") or ""
+        prompt = (
+            "Break the approved plan document into a concrete, ordered execution plan. "
+            "Return JSON only in this exact shape: "
+            '{"tasks":[{"title":"..."}]}. Generate 1 to 6 concrete, ordered steps '
+            "proportionate to the task's complexity: a trivial task needs 1 step, while a multi-stage task may need more. "
+            "Each title must describe work needed for this specific task; do not use generic workflow phases. "
+            "Do not answer the task itself and do not mention unavailable tools.\n\n"
+            f"User task:\n{request.task}\n\n"
+            f"Approved plan document:\n{document}"
+        )
+        try:
+            planner = init_chat_model(model, use_responses_api=False, **self._model_kwargs(base_url, api_key))
+            response = await asyncio.wait_for(
+                planner.ainvoke([{"role": "user", "content": prompt}]),
+                timeout=min(request.timeout_seconds or self.settings.run_timeout_seconds, 60),
+            )
+            return self._parse_plan(getattr(response, "content", ""), request.task)
         except Exception:
             # The run can still proceed when a model provider does not support a separate planning call.
             return self._fallback_plan(request.task)
