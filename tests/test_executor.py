@@ -178,3 +178,33 @@ async def test_emit_step_verifications_skips_without_plan() -> None:
     await executor._emit_step_verifications({"messages": [type("Msg", (), {"content": "[STEP_VERIFIED] x"})()]}, request, emit)
 
     assert emitted == []
+
+
+async def test_emit_step_verifications_falls_back_to_tool_outputs() -> None:
+    executor = DeepAgentExecutor(Settings())
+    request = DeepRunRequest(
+        run_id="run-1", user_id="user-1", agent_id="agent-1", conversation_id="conversation-1",
+        task="t", delegation_token="tok",
+        task_state={"plan": [{"title": "获取 t1"}, {"title": "获取 t2"}]},
+    )
+    emitted: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, data: dict) -> None:
+        emitted.append((event_type, data))
+
+    # 模型未输出 [STEP_VERIFIED] 标记，回退用工具消息输出摘要作为每步验证结论。
+    state = {
+        "messages": [
+            type("Msg", (), {"type": "tool", "content": "t1: 2026-08-16T10:00:00"}),
+            type("Msg", (), {"type": "tool", "content": "t2: 2026-08-16T11:00:00"}),
+            type("Msg", (), {"type": "ai", "content": "完成"}),
+        ]
+    }
+
+    await executor._emit_step_verifications(state, request, emit)
+
+    assert len(emitted) == 2
+    assert emitted[0][1]["stepIndex"] == 1
+    assert emitted[0][1]["verification"] == "t1: 2026-08-16T10:00:00"
+    assert emitted[1][1]["stepIndex"] == 2
+    assert emitted[1][1]["verification"] == "t2: 2026-08-16T11:00:00"

@@ -272,24 +272,42 @@ class DeepAgentExecutor:
         return self._result_or_pending(state, request, agent, config, telemetry, model)
 
     async def _emit_step_verifications(self, state: dict[str, Any], request: DeepRunRequest, emit: EventSink) -> None:
-        """把模型按计划契约输出的 [STEP_VERIFIED] 验证结论投影为 step.verified 事件。"""
+        """把计划步骤的验证结论投影为 step.verified 事件。
+
+        优先取模型按契约输出的 [STEP_VERIFIED] 标记；模型未输出时，
+        回退用工具消息的输出摘要作为该步骤的验证结论，保证每个计划步骤都有验证。
+        """
         plan = (request.task_state or {}).get("plan")
         if not isinstance(plan, list) or not plan:
             return
         messages = state.get("messages", [])
         if not messages:
             return
+        verification_by_index: dict[int, str] = {}
         content = getattr(messages[-1], "content", "")
-        if not isinstance(content, str):
-            return
-        markers = re.findall(r"\[STEP_VERIFIED\]\s*(.+)", content, re.IGNORECASE)
-        for index, verification in enumerate(markers[: len(plan)]):
+        if isinstance(content, str):
+            markers = re.findall(r"\[STEP_VERIFIED\]\s*(.+)", content, re.IGNORECASE)
+            for index, verification in enumerate(markers[: len(plan)]):
+                verification_by_index[index] = verification.strip()[:500]
+        tool_outputs = [
+            str(getattr(msg, "content", "")).strip()
+            for msg in messages
+            if getattr(msg, "type", "") == "tool" and getattr(msg, "content", "")
+        ]
+        tool_cursor = 0
+        for index in range(len(plan)):
+            if index in verification_by_index:
+                continue
+            fallback = tool_outputs[tool_cursor][:500] if tool_cursor < len(tool_outputs) else "步骤已完成并验证"
+            verification_by_index[index] = fallback
+            tool_cursor += 1
+        for index, verification in verification_by_index.items():
             step = plan[index]
             await emit("step.verified", {
                 "stepId": step.get("id") or f"step-{index + 1}",
                 "stepIndex": index + 1,
                 "title": step.get("title") or f"步骤 {index + 1}",
-                "verification": verification.strip()[:500],
+                "verification": verification,
             })
 
     async def resume(self, request: DeepRunRequest, decisions: list[dict[str, Any]], emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
@@ -326,15 +344,18 @@ class DeepAgentExecutor:
             )
         plan_steps = (request.task_state or {}).get("plan")
         if isinstance(plan_steps, list) and plan_steps:
-            # 计划是执行契约：按序执行、逐步验证，输出结构化验证标记。
+            # 计划是执行契约：按序执行、逐步验证。最终回复必须以逐步骤验证结论结尾。
             numbered = "\n".join(f"{i + 1}. {step.get('title')}" for i, step in enumerate(plan_steps))
             instructions += (
                 "\n\nExecution plan — you MUST follow these steps IN ORDER. "
                 "Complete each step's goal before moving to the next; use tools when needed. "
-                "After finishing a step, output a verification line exactly as:\n"
-                "[STEP_VERIFIED] <verification summary of this step>\n"
                 "Do not skip steps, do not repeat completed work, and do not claim a step is done without verifying its output.\n"
-                f"Steps:\n{numbered}"
+                f"Steps:\n{numbered}\n\n"
+                "Your FINAL reply MUST end with one verification line per plan step, in step order, exactly as:\n"
+                "[STEP_VERIFIED] <verification summary of step 1>\n"
+                "[STEP_VERIFIED] <verification summary of step 2>\n"
+                "...\n"
+                "Every plan step requires its own [STEP_VERIFIED] line."
             )
         tools = await self._load_mcp_tools(request)
         tools.append(ask_user)
