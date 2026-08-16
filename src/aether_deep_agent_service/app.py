@@ -234,7 +234,12 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             if hasattr(store, "checkpoint"):
                 await store.checkpoint(request.run_id, {"phase": "running", "task": request.task})
         try:
-            if pending is None and not skip_plan:
+            if plan_approved:
+                # 计划已批准：审批门是 Python 层暂停，图上无检查点，
+                # 直接用已批准的计划开始执行，避免再次规划/审批。
+                await publish_plan("RESUME", "计划已批准，开始执行", task_plan or [])
+                result = await executor.execute(request, emit_runtime_event, checkpointer)
+            elif pending is None and not skip_plan:
                 await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
                 task_plan = await executor.plan(request)
                 await publish_plan("INITIAL", "Task plan created", task_plan)
@@ -243,11 +248,6 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                     await store.save_interaction(request.run_id, "plan_approval", {"plan": task_plan})
                     await safe_callback(request.run_id, "plan.approval.required", {"plan": task_plan})
                     return
-                result = await executor.execute(request, emit_runtime_event, checkpointer)
-            elif plan_approved:
-                # 计划已批准：计划审批门是 Python 层暂停，图上没有检查点，
-                # 因此这里直接开始执行（用已批准的计划），而不是 continue_from_checkpoint。
-                await publish_plan("RESUME", "计划已批准，开始执行", task_plan or [])
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None:
                 if task_plan:
