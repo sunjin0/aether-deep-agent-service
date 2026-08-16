@@ -170,8 +170,12 @@ class DeepAgentExecutor:
         except Exception:
             return self._fallback_plan(request.task)
         prompt = (
-            "Create a concise execution plan for the user's task. Return JSON only in this exact shape: "
-            '{"tasks":[{"title":"..."}]}. Generate 1 to 6 concrete, ordered steps, '
+            "Create a concise execution plan document for the user's task. Return JSON only in this exact shape: "
+            '{"complex":<true|false>,"document":"<1-3 sentence plan document describing the approach, inputs and expected outcome>",'
+            '"tasks":[{"title":"..."}]}. '
+            '"complex" must be true when the task needs a real multi-stage plan with tools or sub-steps, '
+            "and false when it is a simple question the agent can answer directly. "
+            "Generate 1 to 6 concrete, ordered steps, "
             "proportionate to the task's complexity: a trivial task needs 1 step, "
             "while a multi-stage task may need more. "
             "Each title must describe work needed for this specific task; do not use generic workflow phases. "
@@ -184,7 +188,13 @@ class DeepAgentExecutor:
                 planner.ainvoke([{"role": "user", "content": prompt}]),
                 timeout=min(request.timeout_seconds or self.settings.run_timeout_seconds, 60),
             )
-            return self._parse_plan(getattr(response, "content", ""), request.task)
+            content = getattr(response, "content", "")
+            if request.task_state:
+                document = self._parse_plan_document(content)
+                if document:
+                    request.task_state["document"] = document
+                request.task_state["complex"] = self._parse_plan_complex(content)
+            return self._parse_plan(content, request.task)
         except Exception:
             # The run can still proceed when a model provider does not support a separate planning call.
             return self._fallback_plan(request.task)
@@ -243,6 +253,36 @@ class DeepAgentExecutor:
             if isinstance(title, str) and title.strip():
                 tasks.append({"id": f"task-{len(tasks) + 1}", "title": title.strip(), "status": "pending"})
         return tasks if len(tasks) >= 2 else DeepAgentExecutor._fallback_plan(task)
+
+    @staticmethod
+    def _parse_plan_document(content: Any) -> str:
+        """从计划 JSON 中解析方案文档（1-3 句 approach 说明）。"""
+        if not isinstance(content, str):
+            return ""
+        normalized = content.strip()
+        if normalized.startswith("```"):
+            normalized = normalized.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            data = json.loads(normalized)
+            document = data.get("document") if isinstance(data, dict) else None
+            return str(document).strip() if document else ""
+        except (json.JSONDecodeError, AttributeError):
+            return ""
+
+    @staticmethod
+    def _parse_plan_complex(content: Any) -> bool:
+        """从计划 JSON 中解析模型对任务是否复杂的判断。"""
+        if not isinstance(content, str):
+            return False
+        normalized = content.strip()
+        if normalized.startswith("```"):
+            normalized = normalized.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            data = json.loads(normalized)
+            complex_flag = data.get("complex") if isinstance(data, dict) else None
+            return bool(complex_flag)
+        except (json.JSONDecodeError, AttributeError):
+            return False
 
     @staticmethod
     def _fallback_plan(task: str) -> list[dict[str, str]]:

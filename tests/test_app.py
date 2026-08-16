@@ -398,7 +398,7 @@ def test_plan_approval_gate_waits_for_complex_plan(monkeypatch) -> None:
             pass
 
     monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan",
-                        AsyncMock(return_value=[{"title": "步骤一"}, {"title": "步骤二"}, {"title": "步骤三"}]))
+                        AsyncMock(return_value=[{"title": "步骤一"}, {"title": "步骤二"}]))
     monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", execute)
     monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
     monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
@@ -407,7 +407,7 @@ def test_plan_approval_gate_waits_for_complex_plan(monkeypatch) -> None:
     payload = {
         "run_id": "plan-gate", "user_id": "user-1", "agent_id": "agent-1",
         "conversation_id": "conversation-1", "task": "Summarize evidence.", "delegation_token": "token",
-        "plan_approval_required": True,
+        "plan_approval_required": True, "task_state": {"complex": True},
     }
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     timestamp = str(int(time.time()))
@@ -457,7 +457,7 @@ def test_simple_plan_executes_without_approval(monkeypatch) -> None:
     payload = {
         "run_id": "simple-plan", "user_id": "user-1", "agent_id": "agent-1",
         "conversation_id": "conversation-1", "task": "获取当前时间", "delegation_token": "token",
-        "plan_approval_required": True,
+        "plan_approval_required": True, "task_state": {"complex": False},
     }
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     timestamp = str(int(time.time()))

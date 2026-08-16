@@ -180,6 +180,17 @@ async def test_emit_step_verifications_skips_without_plan() -> None:
     assert emitted == []
 
 
+def test_parse_plan_document_and_complex() -> None:
+    content = (
+        '{"complex": true, "document": "先获取合同全文，再逐条分析风险并生成整改清单",'
+        '"tasks": [{"title": "获取合同"}, {"title": "分析风险"}]}'
+    )
+    assert DeepAgentExecutor._parse_plan_document(content) == "先获取合同全文，再逐条分析风险并生成整改清单"
+    assert DeepAgentExecutor._parse_plan_complex(content) is True
+    assert DeepAgentExecutor._parse_plan_complex('{"complex": false, "tasks": []}') is False
+    assert DeepAgentExecutor._parse_plan_document("not json") == ""
+
+
 async def test_emit_step_verifications_falls_back_to_tool_outputs() -> None:
     executor = DeepAgentExecutor(Settings())
     request = DeepRunRequest(

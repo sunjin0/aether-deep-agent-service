@@ -210,10 +210,13 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                     "currentStep": active_index or 0,
                     "planReason": reason,
                 })
-            await safe_callback(request.run_id, "plan.updated", {
+            plan_payload: dict[str, object] = {
                 "reason": reason, "summary": summary, "maxSteps": request.max_steps,
-                "tasks": projected,
-            })
+                "tasks": projected, "complex": bool((request.task_state or {}).get("complex")),
+            }
+            if (request.task_state or {}).get("document"):
+                plan_payload["document"] = request.task_state["document"]
+            await safe_callback(request.run_id, "plan.updated", plan_payload)
 
         async def emit_runtime_event(event_type: str, data: dict) -> None:
             nonlocal task_plan
@@ -245,9 +248,13 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                 await publish_plan("INITIAL", "Task plan created", task_plan)
                 # 计划先行：仅对复杂问题的任务规划（>=3 步）暂停等待用户确认；
                 # 简单任务直接执行（Codex/Claude 风格）。
-                if request.plan_approval_required and len(task_plan) >= 3:
-                    await store.save_interaction(request.run_id, "plan_approval", {"plan": task_plan})
-                    await safe_callback(request.run_id, "plan.approval.required", {"plan": task_plan})
+                complex_task = bool((request.task_state or {}).get("complex"))
+                if request.plan_approval_required and complex_task:
+                    approval_payload: dict[str, object] = {"plan": task_plan, "complex": True}
+                    if (request.task_state or {}).get("document"):
+                        approval_payload["document"] = request.task_state["document"]
+                    await store.save_interaction(request.run_id, "plan_approval", approval_payload)
+                    await safe_callback(request.run_id, "plan.approval.required", approval_payload)
                     return
                 result = await executor.execute(request, emit_runtime_event, checkpointer)
             elif pending is None:
