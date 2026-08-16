@@ -373,8 +373,8 @@ def test_run_started_callback_cancellation_persists_cancelled_status(monkeypatch
     assert stores[0].updates[-1] == ("run-started-cancelled", "CANCELLED", None, None)
 
 
-def test_plan_approval_gate_waits_before_executing(monkeypatch) -> None:
-    """plan_approval_required 时，生成初始计划后暂停等待确认，不执行工具。"""
+def test_plan_approval_gate_waits_for_complex_plan(monkeypatch) -> None:
+    """多步骤复杂计划 + plan_approval_required 时，生成初始计划后暂停等待确认。"""
     settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
     execute = AsyncMock(return_value=ExecutionResult(
         content="Result", citations=[], model="test-model", tools=[], prompt_tokens=None, completion_tokens=None,
@@ -397,6 +397,8 @@ def test_plan_approval_gate_waits_before_executing(monkeypatch) -> None:
         async def save_interaction(self, _run_id, _interaction_type, _payload) -> None:
             pass
 
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan",
+                        AsyncMock(return_value=[{"title": "步骤一"}, {"title": "步骤二"}]))
     monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", execute)
     monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
     monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
@@ -422,3 +424,53 @@ def test_plan_approval_gate_waits_before_executing(monkeypatch) -> None:
     assert execute.await_count == 0  # 计划未确认前不执行
     event_types = [call.args[1] for call in send.await_args_list]
     assert "plan.approval.required" in event_types
+
+
+def test_simple_plan_executes_without_approval(monkeypatch) -> None:
+    """单步简单计划即使 plan_approval_required 也直接执行，不需要审批。"""
+    settings = Settings(shared_secret="test-secret", database_url="sqlite+aiosqlite://")
+    execute = AsyncMock(return_value=ExecutionResult(
+        content="Result", citations=[], model="test-model", tools=[], prompt_tokens=None, completion_tokens=None,
+    ))
+    send = AsyncMock()
+
+    class FakeStore:
+        def __init__(self, _database_url) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            pass
+
+        async def create_if_absent(self, request):
+            return type("Record", (), {"run_id": request.run_id, "status": "QUEUED"})(), True
+
+        async def update(self, _run_id, _status, result=None, error=None) -> None:
+            pass
+
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.plan",
+                        AsyncMock(return_value=[{"title": "获取当前时间"}]))
+    monkeypatch.setattr("aether_deep_agent_service.app.DeepAgentExecutor.execute", execute)
+    monkeypatch.setattr("aether_deep_agent_service.app.CallbackClient.send", send)
+    monkeypatch.setattr("aether_deep_agent_service.app.RunStore", FakeStore)
+
+    app = build_application(settings)
+    payload = {
+        "run_id": "simple-plan", "user_id": "user-1", "agent_id": "agent-1",
+        "conversation_id": "conversation-1", "task": "获取当前时间", "delegation_token": "token",
+        "plan_approval_required": True,
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    with TestClient(app) as client:
+        response = client.post("/v1/runs", content=body, headers={
+            "X-Aether-Key-Id": settings.key_id,
+            "X-Aether-Timestamp": timestamp,
+            "X-Aether-Signature": build_signature(settings.shared_secret, timestamp, body),
+            "Content-Type": "application/json",
+        })
+        assert response.status_code == 202
+        client.portal.call(asyncio.sleep, 0.2)
+
+    assert execute.await_count == 1  # 单步计划直接执行
+    event_types = [call.args[1] for call in send.await_args_list]
+    assert "plan.approval.required" not in event_types

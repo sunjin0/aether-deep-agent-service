@@ -243,8 +243,9 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                 await safe_callback(request.run_id, "run.started", {"status": RunStatus.RUNNING})
                 task_plan = await executor.plan(request)
                 await publish_plan("INITIAL", "Task plan created", task_plan)
-                # 计划先行：生成初始计划后暂停，等待用户确认再执行（Codex/Claude 风格）。
-                if request.plan_approval_required:
+                # 计划先行：仅对复杂问题的任务规划（多步骤）暂停等待用户确认；
+                # 单步简单任务直接执行（Codex/Claude 风格）。
+                if request.plan_approval_required and len(task_plan) >= 2:
                     await store.save_interaction(request.run_id, "plan_approval", {"plan": task_plan})
                     await safe_callback(request.run_id, "plan.approval.required", {"plan": task_plan})
                     return
