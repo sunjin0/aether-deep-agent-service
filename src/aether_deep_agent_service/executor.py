@@ -32,7 +32,7 @@ _SIMPLE_GREETING = re.compile(
 
 
 class AskUserOption(BaseModel):
-    """A selectable answer exposed in the chat interaction card."""
+    """聊天交互卡片中展示的可选答案。"""
 
     id: str = Field(description="Stable option identifier")
     label: str = Field(description="Option text shown to the user")
@@ -40,11 +40,10 @@ class AskUserOption(BaseModel):
 
 
 class AskUserQuestion(BaseModel):
-    """Required schema for collecting missing user information.
+    """收集缺失用户信息的必填结构。
 
-    This is intentionally distinct from tool approval. An ask_user interaction
-    always provides concrete choices and a free-text fallback; it must never be
-    modelled as a confirm/cancel decision.
+    该结构有意区别于工具审批。``ask_user`` 交互始终提供具体选项和自由文本兜底，
+    绝不能建模为确认/取消决策。
     """
 
     id: str = Field(description="Stable question identifier")
@@ -78,18 +77,19 @@ def ask_user(
     ),
     question: str = "",
 ) -> str:
-    """Collect missing user information through choices plus a custom input field.
+    """通过选项和自定义输入框收集缺失的用户信息。
 
-    Do not use this tool for an approval decision. Every question must use type
-    ``choice``, include 2-4 concrete options, and enable custom input.
+    不要将此工具用于审批决策。每个问题必须使用 ``choice`` 类型，提供 2 至 4 个
+    具体选项，并启用自定义输入。
     """
     return "User answers will be provided before this tool continues."
 
 
 class RunTelemetryHandler(AsyncCallbackHandler):
-    """Forwards actual LangChain tool lifecycle events to the Java run audit."""
+    """将实际 LangChain 工具生命周期事件转发至 Java 运行审计。"""
 
     def __init__(self, emit: EventSink) -> None:
+        """初始化事件接收器及本次运行的遥测累计值。"""
         self.emit = emit
         self.tools: list[str] = []
         self._tool_calls_by_run: dict[UUID, tuple[str, float]] = {}
@@ -97,6 +97,7 @@ class RunTelemetryHandler(AsyncCallbackHandler):
         self.completion_tokens: int | None = None
 
     async def on_tool_start(self, serialized: dict[str, Any], input_str: str, *, run_id: UUID, **_: Any) -> None:
+        """记录工具开始时间，并发布工具启动事件。"""
         name = str(serialized.get("name") or serialized.get("id", ["tool"])[-1])
         self.tools.append(name)
         self._tool_calls_by_run[run_id] = (name, time.monotonic())
@@ -122,6 +123,7 @@ class RunTelemetryHandler(AsyncCallbackHandler):
             pass
 
     async def on_tool_end(self, output: Any, *, run_id: UUID, **_: Any) -> None:
+        """汇总工具输出和耗时，并发布工具完成事件。"""
         summary = str(output).replace("\n", " ")[:240]
         name, started_at = self._tool_calls_by_run.pop(run_id, ("tool", time.monotonic()))
         await self.emit("tool.completed", {
@@ -130,6 +132,7 @@ class RunTelemetryHandler(AsyncCallbackHandler):
         })
 
     async def on_tool_error(self, error: BaseException, *, run_id: UUID, **_: Any) -> None:
+        """汇总工具异常和耗时，并发布工具失败事件。"""
         name, started_at = self._tool_calls_by_run.pop(run_id, ("tool", time.monotonic()))
         await self.emit("tool.failed", {
             "toolCallId": str(run_id), "toolName": name, "message": "Tool failed: " + name,
@@ -137,6 +140,7 @@ class RunTelemetryHandler(AsyncCallbackHandler):
         })
 
     async def on_llm_end(self, response: LLMResult, **_: Any) -> None:
+        """从模型响应中累计输入和输出 Token 用量。"""
         usage = (response.llm_output or {}).get("token_usage") or {}
         prompt = usage.get("prompt_tokens") or usage.get("input_tokens")
         completion = usage.get("completion_tokens") or usage.get("output_tokens")
@@ -146,12 +150,16 @@ class RunTelemetryHandler(AsyncCallbackHandler):
             self.completion_tokens = (self.completion_tokens or 0) + completion
 
     async def on_llm_new_token(self, token: str, **_: Any) -> None:
+        """将模型流式增量文本转发给事件接收器。"""
         if token:
             await self.emit("message.delta", {"chunk": token})
 
 
 class DeepAgentExecutor:
+    """负责规划、创建并驱动 LangGraph Deep Agent 的执行器。"""
+
     def __init__(self, settings: Settings, callbacks: CallbackClient | None = None) -> None:
+        """保存服务配置及可选的 Admin 回调客户端。"""
         self.settings = settings
         self._callbacks = callbacks
         self._model_config_cache: dict[str, dict] = {}
@@ -180,6 +188,7 @@ class DeepAgentExecutor:
 
     @staticmethod
     def _model_kwargs(base_url: str | None, api_key: str | None) -> dict[str, str]:
+        """将可选模型连接配置整理为模型初始化参数。"""
         kwargs: dict[str, str] = {}
         if base_url:
             kwargs["base_url"] = base_url
@@ -224,6 +233,7 @@ class DeepAgentExecutor:
 
     @staticmethod
     def _parse_requirement_questions(content: Any) -> list[dict[str, Any]]:
+        """解析模型返回的需求补充问题，并过滤不合法项。"""
         if not isinstance(content, str):
             return []
         normalized = content.strip()
@@ -336,16 +346,15 @@ class DeepAgentExecutor:
             )
             return self._parse_plan(getattr(response, "content", ""), request.task)
         except Exception:
-            # The run can still proceed when a model provider does not support a separate planning call.
+            # 模型提供商不支持独立规划调用时，运行仍可使用兜底计划继续执行。
             return self._fallback_plan(request.task)
 
     async def replan(self, request: DeepRunRequest, previous_plan: list[dict[str, str]],
                      reason: str, observation: str) -> list[dict[str, str]]:
-        """Create a new user-visible plan after a material execution observation.
+        """出现重要执行观察结果后，创建新的用户可见计划。
 
-        This deliberately changes only the auditable plan projection. The durable
-        LangGraph state remains the authority for the next executable action, so
-        a planning call can never repeat a side-effecting tool invocation.
+        此处刻意只变更可审计的计划投影。持久化 LangGraph 状态仍是下一项可执行操作的
+        唯一依据，因此规划调用不会重复触发有副作用的工具调用。
         """
         completed = [dict(item) for item in previous_plan if item.get("status") == "completed"]
         try:
@@ -378,6 +387,7 @@ class DeepAgentExecutor:
 
     @staticmethod
     def _parse_plan(content: Any, task: str) -> list[dict[str, str]]:
+        """解析模型生成的计划 JSON，失败时返回单步兜底计划。"""
         if not isinstance(content, str):
             return DeepAgentExecutor._fallback_plan(task)
         normalized = content.strip()
@@ -478,11 +488,13 @@ class DeepAgentExecutor:
 
     @staticmethod
     def _fallback_plan(task: str) -> list[dict[str, str]]:
+        """为无法规划的任务生成包含任务原文的单步计划。"""
         title = task.strip().replace("\n", " ")[:80] or "完成当前任务"
         return [{"id": "task-1", "title": title, "status": "pending"}]
 
     @staticmethod
     def _fallback_replan(task: str, reason: str, observation: str, completed_count: int) -> list[dict[str, str]]:
+        """在重规划失败时生成一条包含原因和观察结果的后续步骤。"""
         detail = observation.strip().replace("\n", " ")[:80]
         suffix = f"（{detail}）" if detail else ""
         title = task.strip().replace("\n", " ")[:70] or "完成当前任务"
@@ -493,13 +505,14 @@ class DeepAgentExecutor:
         }]
 
     async def execute(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
+        """以初始消息执行新的 Agent 图，并返回结果或待审批请求。"""
         agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
         state = await asyncio.wait_for(agent.ainvoke({"messages": self._initial_messages(request)}, config=config), timeout=request.timeout_seconds)
         await self._emit_step_verifications(state, request, emit)
         return self._result_or_pending(state, request, agent, config, telemetry, model)
 
     async def continue_from_checkpoint(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
-        """Resume a paused graph from LangGraph's durable thread checkpoint."""
+        """从 LangGraph 持久化线程检查点恢复已暂停的图。"""
         agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
         state = await asyncio.wait_for(agent.ainvoke(None, config=config), timeout=request.timeout_seconds)
         await self._emit_step_verifications(state, request, emit)
@@ -545,12 +558,13 @@ class DeepAgentExecutor:
             })
 
     async def resume(self, request: DeepRunRequest, decisions: list[dict[str, Any]], emit: EventSink, checkpointer: Any) -> "ExecutionResult | PendingApproval":
-        """Rebuild the graph and use the durable thread state to resolve an interrupt."""
+        """重建图，并使用持久化线程状态处理一次中断。"""
         agent, config, telemetry, model = await self._create_agent(request, emit, checkpointer)
         state = await asyncio.wait_for(agent.ainvoke(Command(resume={"decisions": decisions}), config=config), timeout=request.timeout_seconds)
         return self._result_or_pending(state, request, agent, config, telemetry, model)
 
     async def _create_agent(self, request: DeepRunRequest, emit: EventSink, checkpointer: Any) -> tuple[Any, dict[str, Any], RunTelemetryHandler, str]:
+        """解析模型与工具配置，创建可检查点恢复的 Deep Agent。"""
         # 模型配置（model/baseUrl/apiKey）优先来自 Admin 的 agent/provider 解析；
         # Java 供应商通常只保存模型名（如 deepseek-v4-flash），显式补充 provider
         # 避免 LangChain 将其误判为需要额外 SDK 的原生 DeepSeek 模型。
@@ -602,9 +616,8 @@ class DeepAgentExecutor:
             model, use_responses_api=False, streaming=True,
             **self._model_kwargs(model_base_url, model_api_key),
         )
-        # `never` is an explicit run-scoped grant issued by Java. Other policies
-        # interrupt here; Java evaluates per-action risk and auto-resumes a
-        # low-risk `risky` batch without exposing a confirmation card.
+        # `never` 是 Java 签发的仅限当前运行的显式授权。其余策略在此中断，由 Java
+        # 逐项评估风险，并自动恢复低风险的 `risky` 批次，不展示确认卡片。
         interrupt_on = self._build_interrupt_on(tools, request.tool_approval_policy)
         agent = create_deep_agent(
             model=chat_model,
@@ -621,26 +634,28 @@ class DeepAgentExecutor:
         config = {
             "recursion_limit": recursion_limit,
             "callbacks": [telemetry],
-            # A session is durable across user requests. run_id remains an
-            # execution-attempt/audit identifier rather than the memory key.
+            # 会话在多次用户请求间保持持久化；run_id 是执行尝试/审计标识，而非记忆键。
             "configurable": {"thread_id": request.session_id or request.conversation_id},
         }
         return agent, config, telemetry, model
 
     @staticmethod
     def _initial_messages(request: DeepRunRequest) -> list[dict[str, str]]:
+        """拼接持久化会话消息、当前任务和知识证据。"""
         messages = [{"role": item.role, "content": item.content} for item in request.conversation_memory]
         messages.append({"role": "user", "content": f"Task:\n{request.task}\n\nEvidence:\n{DeepAgentExecutor._source_context(request)}"})
         return messages
 
     @staticmethod
     def _source_context(request: DeepRunRequest) -> str:
+        """将知识来源格式化为附带引用编号的模型上下文。"""
         return "\n\n".join(f"[{source.citation}] {source.documentName or source.title}\n{source.content}" for source in request.knowledge_sources)
 
     @staticmethod
     def _build_interrupt_on(tools: list, approval_policy: str) -> dict[str, dict[str, list[str]]]:
+        """根据审批策略为工具生成图中断决策配置。"""
         decision_config = {"allowed_decisions": ["approve", "reject"]}
-        # ask_user is answered by the human; it is not a binary tool approval.
+        # ask_user 由用户回答，并非二元工具审批。
         interrupts = {ask_user.name: {"allowed_decisions": ["respond"]}}
         if approval_policy != "never":
             interrupts.update({tool.name: decision_config for tool in tools if tool.name != ask_user.name})
@@ -649,6 +664,7 @@ class DeepAgentExecutor:
     def _result_or_pending(self, state: dict[str, Any], request: DeepRunRequest,
                            agent: Any, config: dict[str, Any], telemetry: RunTelemetryHandler,
                            model: str) -> "ExecutionResult | PendingApproval":
+        """将图状态转换为最终结果，或转换为待人工处理的中断请求。"""
         interrupts = state.get("__interrupt__") or []
         if interrupts:
             raw = getattr(interrupts[0], "value", interrupts[0])
@@ -679,15 +695,18 @@ class DeepAgentExecutor:
 
     @staticmethod
     def _strip_step_verified(content: str) -> str:
+        """移除仅用于内部计划验证的步骤标记。"""
         lines = [line for line in content.splitlines()
                  if not re.match(r"^\s*\[STEP_VERIFIED\]", line, re.IGNORECASE)]
         return "\n".join(lines).strip()
 
     @staticmethod
     def _normalize_citation_format(content: str) -> str:
+        """将半角数字引用规范为 Java 侧使用的全角引用格式。"""
         return re.sub(r"(?<!【)\[(\d+)\]", r"【\1】", content)
 
     async def _load_mcp_tools(self, request: DeepRunRequest) -> list:
+        """加载 MCP 工具，并严格限制为请求允许调用的工具集合。"""
         if not request.allowed_tools:
             return []
         if not self.settings.mcp_url:
@@ -706,6 +725,7 @@ class DeepAgentExecutor:
 
 @dataclass
 class ExecutionResult:
+    """一次成功执行的最终文本、引用、工具和用量统计。"""
     content: str
     citations: list[dict]
     model: str
@@ -716,6 +736,7 @@ class ExecutionResult:
 
 @dataclass
 class PendingApproval:
+    """Agent 图因工具调用等待人工审批时保留的上下文。"""
     request: DeepRunRequest
     agent: Any
     config: dict[str, Any]
@@ -727,5 +748,6 @@ class PendingApproval:
 
 @dataclass
 class PendingUserQuestion:
+    """Agent 图因 ``ask_user`` 等待用户补充信息时保留的上下文。"""
     request: DeepRunRequest
     actions: list[dict[str, Any]]

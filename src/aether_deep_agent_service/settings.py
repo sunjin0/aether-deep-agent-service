@@ -5,6 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """从环境变量和 ``.env`` 文件加载服务运行配置。"""
+
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="AETHER_DEEP_AGENT_", extra="ignore"
     )
@@ -24,4 +26,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """返回进程内缓存的服务配置实例。"""
     return Settings()

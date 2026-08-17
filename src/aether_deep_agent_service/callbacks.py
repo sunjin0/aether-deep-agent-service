@@ -13,10 +13,14 @@ logger = logging.getLogger(__name__)
 
 
 class CallbackClient:
+    """向 Java Admin 投递运行事件并获取 Agent 模型配置的客户端。"""
+
     def __init__(self, settings: Settings) -> None:
+        """保存回调地址、签名密钥及重试配置。"""
         self.settings = settings
 
     async def send(self, run_id: str, event_type: str, data: dict) -> None:
+        """创建回调事件并在配置了地址时投递。"""
         if not self.settings.callback_base_url:
             return
         event = CallbackEvent(
@@ -26,6 +30,7 @@ class CallbackClient:
         await self.send_event(event)
 
     async def send_event(self, event: CallbackEvent) -> None:
+        """投递已创建的回调事件。"""
         await self._send_with_retry(event.run_id, event)
 
     async def fetch_model_config(self, agent_id: str) -> dict | None:
@@ -62,6 +67,7 @@ class CallbackClient:
             return None
 
     async def _send_with_retry(self, run_id: str, event: CallbackEvent) -> None:
+        """使用线性退避重试可恢复的 HTTP 回调失败。"""
         body = event.model_dump_json().encode("utf-8")
         headers_base = {
             "Content-Type": "application/json",

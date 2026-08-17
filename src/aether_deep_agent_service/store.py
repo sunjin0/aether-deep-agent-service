@@ -10,6 +10,8 @@ from .schemas import DeepRunRequest, RunStatus
 
 
 class Base(DeclarativeBase):
+    """SQLAlchemy ORM 模型的声明式基类。"""
+
     pass
 
 
@@ -17,6 +19,7 @@ JsonValue = JSON().with_variant(JSONB, "postgresql")
 
 
 class RunRecord(Base):
+    """持久化的 Deep Agent 运行请求、状态与最终结果。"""
     __tablename__ = "deep_agent_run"
 
     run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -32,6 +35,7 @@ class RunRecord(Base):
 
 
 class RunCheckpoint(Base):
+    """运行过程中按序保存的可恢复状态快照。"""
     __tablename__ = "deep_agent_checkpoint"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(String(64), ForeignKey("deep_agent_run.run_id"), nullable=False, index=True)
@@ -41,6 +45,7 @@ class RunCheckpoint(Base):
 
 
 class PendingInteraction(Base):
+    """等待用户回答或工具审批的持久化交互记录。"""
     __tablename__ = "deep_agent_pending_interaction"
     run_id: Mapped[str] = mapped_column(String(64), ForeignKey("deep_agent_run.run_id"), primary_key=True)
     interaction_type: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -49,6 +54,7 @@ class PendingInteraction(Base):
 
 
 class CallbackOutbox(Base):
+    """用于确保回调至少投递一次的事件发件箱记录。"""
     __tablename__ = "deep_agent_callback_outbox"
     event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -59,14 +65,19 @@ class CallbackOutbox(Base):
 
 
 class RunStore:
+    """封装运行、检查点、交互和回调发件箱的异步数据库访问。"""
+
     def __init__(self, database_url: str) -> None:
+        """根据数据库地址创建异步引擎和会话工厂。"""
         self.engine = create_async_engine(database_url)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
 
     async def initialize(self) -> None:
+        """创建 ORM 表，并在 PostgreSQL 上顺序执行未应用的迁移。"""
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
             if connection.dialect.name == "postgresql":
+                # 仅对 PostgreSQL 执行版本化 SQL 迁移；SQLite 测试库由 ORM 建表即可。
                 await connection.execute(text("CREATE TABLE IF NOT EXISTS deep_agent_schema_migration (version VARCHAR(64) PRIMARY KEY, applied_at BIGINT NOT NULL)"))
                 migration_dir = Path(__file__).with_name("migrations")
                 for migration in sorted(migration_dir.glob("*.sql")):
@@ -78,6 +89,7 @@ class RunStore:
                         await connection.execute(text("INSERT INTO deep_agent_schema_migration(version, applied_at) VALUES (:version, :applied_at)"), {"version": migration.name, "applied_at": int(time.time() * 1000)})
 
     async def create_if_absent(self, request: DeepRunRequest) -> tuple[RunRecord, bool]:
+        """按运行标识幂等创建排队记录，返回记录及是否新建。"""
         now = int(time.time() * 1000)
         async with self.sessions() as session:
             existing = await session.get(RunRecord, request.run_id)
@@ -97,10 +109,12 @@ class RunStore:
             return record, True
 
     async def get(self, run_id: str) -> RunRecord | None:
+        """按运行标识查询持久化记录。"""
         async with self.sessions() as session:
             return await session.get(RunRecord, run_id)
 
     async def latest_for_session(self, session_id: str, task_id: str | None = None) -> RunRecord | None:
+        """查询会话或会话任务最近更新的运行记录。"""
         async with self.sessions() as session:
             query = select(RunRecord).where(RunRecord.session_id == session_id)
             if task_id is not None:
@@ -110,6 +124,7 @@ class RunStore:
 
     async def update(self, run_id: str, status: RunStatus, result: str | None = None,
                      error: str | None = None) -> None:
+        """更新运行状态、结果或错误信息。"""
         async with self.sessions() as session:
             record = await session.get(RunRecord, run_id)
             if record is None:
@@ -123,6 +138,7 @@ class RunStore:
             await session.commit()
 
     async def request_pause(self, run_id: str) -> RunRecord | None:
+        """记录暂停请求，供取消处理分支区分暂停与取消。"""
         async with self.sessions() as session:
             record = await session.get(RunRecord, run_id)
             if record is not None:
@@ -132,6 +148,7 @@ class RunStore:
             return record
 
     async def checkpoint(self, run_id: str, state: dict) -> int:
+        """追加运行状态检查点，并返回递增后的检查点编号。"""
         now = int(time.time() * 1000)
         async with self.sessions() as session:
             latest = (await session.execute(select(RunCheckpoint.checkpoint_no).where(RunCheckpoint.run_id == run_id).order_by(RunCheckpoint.checkpoint_no.desc()).limit(1))).scalar_one_or_none()
@@ -141,10 +158,12 @@ class RunStore:
             return checkpoint_no
 
     async def latest_checkpoint(self, run_id: str) -> RunCheckpoint | None:
+        """读取指定运行的最新检查点。"""
         async with self.sessions() as session:
             return (await session.execute(select(RunCheckpoint).where(RunCheckpoint.run_id == run_id).order_by(RunCheckpoint.checkpoint_no.desc()).limit(1))).scalar_one_or_none()
 
     async def save_interaction(self, run_id: str, interaction_type: str, payload: dict) -> None:
+        """创建或覆盖运行当前等待处理的交互。"""
         async with self.sessions() as session:
             interaction = await session.get(PendingInteraction, run_id)
             if interaction is None:
@@ -157,6 +176,7 @@ class RunStore:
             await session.commit()
 
     async def take_interaction(self, run_id: str) -> PendingInteraction | None:
+        """读取并删除运行当前交互，确保交互只能被消费一次。"""
         async with self.sessions() as session:
             interaction = await session.get(PendingInteraction, run_id)
             if interaction is not None:
@@ -165,6 +185,7 @@ class RunStore:
             return interaction
 
     async def pause_incomplete_runs(self) -> list[str]:
+        """将服务重启前尚未结束的运行统一标记为暂停。"""
         async with self.sessions() as session:
             records = list((await session.execute(select(RunRecord).where(RunRecord.status.in_([RunStatus.QUEUED, RunStatus.RUNNING])))).scalars())
             now = int(time.time() * 1000)
@@ -176,11 +197,13 @@ class RunStore:
             return [record.run_id for record in records]
 
     async def status(self, run_id: str) -> tuple[RunRecord | None, int]:
+        """返回运行记录及其最新检查点编号。"""
         record = await self.get(run_id)
         checkpoint = await self.latest_checkpoint(run_id)
         return record, checkpoint.checkpoint_no if checkpoint is not None else 0
 
     async def enqueue_callback(self, event_id: str, run_id: str, event_type: str, data: dict, occurred_at: int) -> CallbackOutbox:
+        """按事件标识幂等写入待投递回调。"""
         async with self.sessions() as session:
             event = await session.get(CallbackOutbox, event_id)
             if event is None:
@@ -189,11 +212,13 @@ class RunStore:
             return event
 
     async def mark_callback_delivered(self, event_id: str) -> None:
+        """将指定回调事件标记为已成功投递。"""
         async with self.sessions() as session:
             event = await session.get(CallbackOutbox, event_id)
             if event is not None:
                 event.delivered = True; await session.commit()
 
     async def pending_callbacks(self) -> list[CallbackOutbox]:
+        """按发生时间返回尚未投递成功的回调事件。"""
         async with self.sessions() as session:
             return list((await session.execute(select(CallbackOutbox).where(CallbackOutbox.delivered == False).order_by(CallbackOutbox.occurred_at))).scalars())

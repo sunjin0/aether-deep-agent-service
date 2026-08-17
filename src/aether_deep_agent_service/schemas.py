@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 
 class RunStatus(StrEnum):
+    """Deep Agent 运行生命周期的持久化状态。"""
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
@@ -14,6 +15,7 @@ class RunStatus(StrEnum):
 
 
 class KnowledgeSource(BaseModel):
+    """提供给 Agent 的知识库证据片段及其引用元数据。"""
     title: str
     content: str
     citation: str
@@ -27,12 +29,13 @@ class KnowledgeSource(BaseModel):
 
 
 class ConversationMemoryMessage(BaseModel):
-    """A bounded, persisted message supplied from the owning conversation."""
+    """由所属会话提供、长度受限且可持久化的消息。"""
     role: str = Field(pattern="^(system|user|assistant)$")
     content: str = Field(min_length=1, max_length=24000)
 
 
 class DeepRunRequest(BaseModel):
+    """由 Java Admin 发起的一次 Deep Agent 执行请求。"""
     run_id: str = Field(min_length=1, max_length=64)
     user_id: str = Field(min_length=1, max_length=64)
     agent_id: str = Field(min_length=1, max_length=64)
@@ -54,18 +57,21 @@ class DeepRunRequest(BaseModel):
 
 
 class DeepRunResponse(BaseModel):
+    """提交运行后返回的运行标识、状态和创建结果。"""
     run_id: str
     status: RunStatus
     created: bool
 
 
 class ResumeRunRequest(BaseModel):
+    """恢复运行时提交的审批决策、用户答案或计划反馈。"""
     decisions: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     answers: dict[str, Any] = Field(default_factory=dict)
     plan_feedback: str | None = None
 
 
 class DeepRunStatusResponse(BaseModel):
+    """单个运行的持久化状态与检查点信息。"""
     run_id: str
     status: RunStatus
     checkpoint_no: int = 0
@@ -73,7 +79,7 @@ class DeepRunStatusResponse(BaseModel):
 
 
 class DeepSessionStatusResponse(BaseModel):
-    """Latest durable execution state for one Admin-owned Agent Session."""
+    """一个由 Admin 管理的 Agent 会话的最新持久化执行状态。"""
     session_id: str
     task_id: str | None = None
     run_id: str | None = None
@@ -83,6 +89,7 @@ class DeepSessionStatusResponse(BaseModel):
 
 
 class CallbackEvent(BaseModel):
+    """发送给 Java Admin 的运行生命周期事件。"""
     event_id: str
     event_type: str
     run_id: str

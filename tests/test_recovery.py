@@ -1,14 +1,11 @@
-"""Restart recovery and idempotent redelivery verification.
+"""服务重启恢复与幂等重投验证。
 
-These tests simulate a Deep Agent service restart by seeding durable state
-(run, outbox, pending interaction, checkpoint) through one ``RunStore``
-instance and then rebuilding a fresh application over the same SQLite file.
-The delivery layer and the graph executor are mocked so the assertions target
-the recovery wiring, not the model or the network.
+这些测试通过一个 ``RunStore`` 实例预置持久化状态（运行、发件箱、待处理交互和
+检查点），再基于同一 SQLite 文件重建应用，以模拟 Deep Agent 服务重启。投递层与
+图执行器均被模拟，因此断言只验证恢复流程衔接，而不依赖模型或网络。
 
-Every scenario runs inside a single ``asyncio.run`` so no pytest-asyncio test
-loop or TestClient portal thread leaks across tests (the existing suite is
-sync + TestClient and must stay that way).
+每个场景均在单个 ``asyncio.run`` 内运行，避免 pytest-asyncio 测试循环或
+TestClient 门户线程跨测试泄漏（现有套件使用同步测试与 TestClient，必须保持不变）。
 """
 
 import asyncio
@@ -77,7 +74,7 @@ def test_pause_incomplete_runs_on_restart(tmp_path) -> None:
         await store.update("succeeded-run", RunStatus.SUCCEEDED, result="done")
         await store.engine.dispose()
 
-        # Fresh application = a service restart; lifespan marks interrupted runs PAUSED.
+        # 新建应用等同于服务重启；生命周期会将中断的运行标记为 PAUSED。
         app = build_application(_settings(url))
         async with app.router.lifespan_context(app):
             pass
@@ -120,7 +117,7 @@ def test_undelivered_outbox_replayed_and_delivered_skipped_on_restart(tmp_path, 
         await restarted.initialize()
         pending = await restarted.pending_callbacks()
         await restarted.engine.dispose()
-        # Replayed events are marked delivered so a second restart does not re-send them.
+        # 重放事件会被标记为已投递，第二次重启时不会再次发送。
         assert pending == []
 
     asyncio.run(scenario())
@@ -173,7 +170,7 @@ def test_tool_approval_interaction_restored_after_restart(tmp_path, monkeypatch)
         await restarted.initialize()
         interaction = await restarted.take_interaction("run-1")
         await restarted.engine.dispose()
-        assert interaction is None  # interaction consumed exactly once
+        assert interaction is None  # 交互记录只能被消费一次
 
     asyncio.run(scenario())
 
@@ -246,7 +243,7 @@ def test_plan_projection_restored_from_checkpoint_on_resume(tmp_path, monkeypatc
         assert plan_events[0].data["reason"] == "RESUME"
         tasks = plan_events[0].data["tasks"]
         assert [task["title"] for task in tasks] == ["已提取条款", "分析风险"]
-        assert tasks[0]["status"] == "running"  # projected active step, not re-executed as completed
+        assert tasks[0]["status"] == "running"  # 投影中的当前步骤，不会被重放为已完成
 
     asyncio.run(scenario())
 

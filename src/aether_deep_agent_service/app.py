@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 def update_task_plan(tasks: list[dict[str, str]], active_index: int | None = None,
                      completed: bool = False) -> list[dict[str, str]]:
-    """Return a copy of a model-generated plan with the current execution status applied."""
+    """复制模型生成的计划，并写入当前执行状态。"""
     result = [dict(task) for task in tasks]
     for index, task in enumerate(result):
         task["status"] = "completed" if completed or (active_index is not None and index < active_index) else (
@@ -55,11 +55,10 @@ def todos_to_tasks(todos: list) -> list[dict[str, str]]:
 
 
 def normalize_ask_user_payload(payload: dict) -> dict:
-    """Normalize model-generated questions to selectable dashboard questions.
+    """将模型生成的问题规范为 Dashboard 可选择的问题。
 
-    ``ask_user`` is used to collect missing business information, not to approve a
-    tool call.  It therefore always exposes choices together with a custom input
-    field.  Tool approvals remain a separate confirm interaction.
+    ``ask_user`` 用于收集缺失的业务信息，而非批准工具调用。因此始终提供选项和
+    自定义输入框；工具审批仍通过独立的确认交互处理。
     """
     normalized = []
     for index, raw in enumerate(payload.get("questions") or []):
@@ -98,7 +97,7 @@ def normalize_ask_user_payload(payload: dict) -> dict:
 
 
 def build_ask_user_response_decisions(answers: dict) -> list[dict[str, str]]:
-    """Return the HITL response that feeds answers into the suspended ask_user call."""
+    """构造将用户答案传回暂停的 ``ask_user`` 调用的人工介入响应。"""
     answer_json = json.dumps(answers or {}, ensure_ascii=False)
     return [{
         "type": "respond",
@@ -111,15 +110,17 @@ def build_ask_user_response_decisions(answers: dict) -> list[dict[str, str]]:
 
 
 def resolve_run_timeout(payload: DeepRunRequest, settings: Settings) -> int:
+    """确定本次运行使用的超时时间，优先采用请求中的显式配置。"""
     return payload.timeout_seconds if payload.timeout_seconds is not None else settings.run_timeout_seconds
 
 
 def graph_checkpoint_url(database_url: str) -> str:
-    """Convert SQLAlchemy's asyncpg URL to the psycopg URL used by LangGraph."""
+    """将 SQLAlchemy 的 asyncpg URL 转为 LangGraph 使用的 psycopg URL。"""
     return database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
 def build_application(settings: Settings | None = None) -> FastAPI:
+    """构建并配置 Deep Agent 的 FastAPI 应用实例。"""
     resolved_settings = settings or get_settings()
     store = RunStore(resolved_settings.database_url)
     callbacks = CallbackClient(resolved_settings)
@@ -132,6 +133,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        """初始化存储与检查点，并在启动时恢复未投递事件。"""
         nonlocal checkpointer
         await store.initialize()
         checkpoint_context = None
@@ -140,7 +142,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             checkpointer = await checkpoint_context.__aenter__()
             await checkpointer.setup()
         else:
-            # SQLite is retained solely for lightweight unit tests; deployed services require PostgreSQL.
+            # SQLite 仅用于轻量单元测试；部署环境必须使用 PostgreSQL。
             checkpointer = InMemorySaver()
         if hasattr(store, "pause_incomplete_runs"):
             for interrupted_run_id in await store.pause_incomplete_runs():
@@ -163,9 +165,11 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Aether Deep Agent Service", version="0.1.0", lifespan=lifespan)
 
     async def authenticated(request: Request) -> None:
+        """验证调用方的 HMAC 请求签名。"""
         await verify_request_signature(request, resolved_settings)
 
     async def safe_callback(run_id: str, event_type: str, data: dict) -> None:
+        """持久化并投递回调事件；投递失败仅记录日志，不中断运行。"""
         event = CallbackEvent(event_id=str(uuid.uuid4()), event_type=event_type, run_id=run_id, occurred_at=int(time.time() * 1000), data=data)
         try:
             if hasattr(store, "enqueue_callback"):
@@ -180,6 +184,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             logger.exception("Failed to deliver callback %s for run %s", event_type, run_id)
 
     async def finish_execution(request: DeepRunRequest, result: ExecutionResult | PendingApproval) -> None:
+        """处理执行结果，并持久化或通知等待中的人工交互。"""
         if isinstance(result, PendingApproval):
             if result.actions and result.actions[0].get("name") == "ask_user":
                 pending_questions[request.run_id] = PendingUserQuestion(request, result.actions)
@@ -206,12 +211,12 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     async def run(request: DeepRunRequest, pending: PendingApproval | PendingUserQuestion | None = None,
                   decisions: list[dict] | None = None, skip_plan: bool = False, plan_approved: bool = False,
                   skip_analysis: bool = False, plan_feedback: str | None = None) -> None:
+        """执行、恢复或重规划一次 Deep Agent 运行，并维护计划投影。"""
         task_plan = task_plans.get(request.run_id, [])
         # write_todos 去重：仅当模型更新了 todos 才覆盖发布计划，避免每个计划步骤都产生新版本。
         last_todos_json: str = ""
-        # The in-memory task plan is merely a delivery cache. Restore the latest
-        # durable projection after a service restart so resume/completion does
-        # not discard the user's visible plan.
+        # 内存任务计划只是投递缓存；服务重启后恢复最新持久化投影，避免恢复或完成时
+        # 丢失用户可见的计划。
         if hasattr(store, "latest_checkpoint"):
             checkpoint = await store.latest_checkpoint(request.run_id)
             if checkpoint is not None and isinstance(checkpoint.state, dict):
@@ -233,6 +238,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         async def publish_plan(reason: str, summary: str, plan: list[dict[str, str]],
                                active_index: int | None = 0, completed: bool = False,
                                preserve_status: bool = False) -> None:
+            """保存任务计划投影，并向调用方发布计划更新事件。"""
             projected = ([dict(task) for task in plan]
                          if preserve_status else update_task_plan(plan, active_index=active_index, completed=completed))
             task_plans[request.run_id] = projected
@@ -256,6 +262,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             await safe_callback(request.run_id, "plan.updated", plan_payload)
 
         async def emit_runtime_event(event_type: str, data: dict) -> None:
+            """转发执行期事件，并在工具结果改变路径时更新计划。"""
             nonlocal task_plan, last_todos_json
             if event_type == "todos.updated":
                 # write_todos 是模型最新的执行计划：覆盖投影并发布 plan.updated（去重）。
@@ -271,9 +278,8 @@ def build_application(settings: Settings | None = None) -> FastAPI:
             # write_todos 已由 todos.updated 分支同步计划，工具完成事件不再触发模型重规划。
             if event_type in {"tool.completed", "tool.failed"} and data.get("toolName") == "write_todos":
                 return
-            # Tool observations can change the viable path. Replan before the
-            # graph decides its next action; the plan projection itself has no
-            # authority to replay a side-effecting tool.
+            # 工具观察结果可能改变可行路径。图决定下一步操作前先重规划；计划投影本身
+            # 无权重放会产生副作用的工具调用。
             if event_type in {"tool.completed", "tool.failed"} and task_plan:
                 failed = event_type == "tool.failed"
                 reason = "STEP_FAILED" if failed else "TOOL_RESULT"
@@ -361,11 +367,13 @@ def build_application(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, str]:
+        """返回服务存活状态。"""
         return {"status": "ok"}
 
     @app.post("/v1/runs", response_model=DeepRunResponse, status_code=status.HTTP_202_ACCEPTED,
               dependencies=[Depends(authenticated)])
     async def create_run(payload: DeepRunRequest) -> DeepRunResponse:
+        """创建幂等运行记录，并异步启动新任务。"""
         payload.timeout_seconds = resolve_run_timeout(payload, resolved_settings)
         record, created = await store.create_if_absent(payload)
         if created:
@@ -375,7 +383,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/sessions/{session_id}/tasks", response_model=DeepRunResponse,
               status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(authenticated)])
     async def create_session_task(session_id: str, payload: DeepRunRequest) -> DeepRunResponse:
-        """Session-scoped alias for new clients; legacy Admin callers keep using /v1/runs."""
+        """面向新客户端的会话级别别名；旧版 Admin 调用方仍使用 ``/v1/runs``。"""
         if payload.session_id is not None and payload.session_id != session_id:
             raise HTTPException(status_code=422, detail="session_id does not match request path")
         return await create_run(payload.model_copy(update={"session_id": session_id}))
@@ -383,6 +391,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED,
               dependencies=[Depends(authenticated)])
     async def cancel_run(run_id: str) -> dict[str, str]:
+        """取消正在执行的运行，或将尚未结束的记录标为已取消。"""
         record = await store.get(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="run not found")
@@ -396,6 +405,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/runs/{run_id}/pause", status_code=status.HTTP_202_ACCEPTED,
               dependencies=[Depends(authenticated)])
     async def pause_run(run_id: str) -> dict[str, str]:
+        """请求暂停运行并取消当前异步任务以保留恢复点。"""
         record = await store.request_pause(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="run not found")
@@ -409,6 +419,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/runs/{run_id}", response_model=DeepRunStatusResponse,
              dependencies=[Depends(authenticated)])
     async def get_run(run_id: str) -> DeepRunStatusResponse:
+        """查询指定运行及其最新检查点编号。"""
         record, checkpoint_no = await store.status(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="run not found")
@@ -417,6 +428,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/sessions/{session_id}", response_model=DeepSessionStatusResponse,
              dependencies=[Depends(authenticated)])
     async def get_session(session_id: str) -> DeepSessionStatusResponse:
+        """查询会话最近一次任务的持久化状态。"""
         record = await store.latest_for_session(session_id)
         if record is None:
             raise HTTPException(status_code=404, detail="session not found")
@@ -427,6 +439,7 @@ def build_application(settings: Settings | None = None) -> FastAPI:
         )
 
     async def resume_existing_run(run_id: str, payload: ResumeRunRequest) -> dict[str, str]:
+        """根据持久化交互或检查点恢复已有运行。"""
         record = await store.get(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="run not found")
@@ -501,11 +514,13 @@ def build_application(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/runs/{run_id}/resume", status_code=status.HTTP_202_ACCEPTED,
               dependencies=[Depends(authenticated)])
     async def resume_run(run_id: str, payload: ResumeRunRequest) -> dict[str, str]:
+        """恢复指定运行。"""
         return await resume_existing_run(run_id, payload)
 
     @app.post("/v1/sessions/{session_id}/tasks/{task_id}/resume", status_code=status.HTTP_202_ACCEPTED,
               dependencies=[Depends(authenticated)])
     async def resume_session_task(session_id: str, task_id: str, payload: ResumeRunRequest) -> dict[str, str]:
+        """按会话和任务标识定位并恢复最近一次运行。"""
         record = await store.latest_for_session(session_id, task_id)
         if record is None:
             raise HTTPException(status_code=404, detail="task not found in session")
