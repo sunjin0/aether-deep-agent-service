@@ -1,7 +1,7 @@
 import asyncio
 import ast
-import json
 import re
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal
@@ -659,6 +659,8 @@ class DeepAgentExecutor:
         interrupts = {ask_user.name: {"allowed_decisions": ["respond"]}}
         if approval_policy != "never":
             interrupts.update({tool.name: decision_config for tool in tools if tool.name != ask_user.name})
+        # 邮件是不可逆的外部投递，即使会话策略为 never 也必须逐封确认。
+        interrupts.update({tool.name: decision_config for tool in tools if tool.name == "send_email"})
         return interrupts
 
     def _result_or_pending(self, state: dict[str, Any], request: DeepRunRequest,
@@ -711,11 +713,14 @@ class DeepAgentExecutor:
             return []
         if not self.settings.mcp_url:
             raise RuntimeError("AETHER_DEEP_AGENT_MCP_URL is not configured for requested MCP tools")
+        headers = {"Authorization": "Bearer " + request.delegation_token}
+        if request.email_credential_tokens:
+            headers["X-Aether-Email-Credentials"] = json.dumps(request.email_credential_tokens, separators=(",", ","))
         client = MultiServerMCPClient({
             "aether": {
                 "transport": "http",
                 "url": self.settings.mcp_url,
-                "headers": {"Authorization": "Bearer " + request.delegation_token},
+                "headers": headers,
             }
         })
         loaded = await client.get_tools()

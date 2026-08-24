@@ -49,6 +49,8 @@ class DeepRunRequest(BaseModel):
     knowledge_sources: list[KnowledgeSource] = Field(default_factory=list)
     allowed_tools: list[str] = Field(default_factory=list)
     delegation_token: str = Field(min_length=1)
+    # 加密的短期 SMTP 凭据令牌；仅转发给 MCP，严禁进入模型或回调。
+    email_credential_tokens: dict[str, str] = Field(default_factory=dict)
     tool_approval_policy: str = Field(default="ask", pattern="^(ask|risky|never)$")
     max_steps: int = Field(default=12, ge=1, le=50)
     # 计划先行：生成初始计划后暂停等待用户确认，批准后才开始执行（Codex/Claude 风格）。
