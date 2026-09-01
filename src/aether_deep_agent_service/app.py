@@ -16,6 +16,7 @@ from .schemas import (CallbackEvent, DeepRunRequest, DeepRunResponse, DeepRunSta
 from .security import verify_request_signature
 from .settings import Settings, get_settings
 from .store import RunStore
+from .telemetry import OTelMiddleware, configure_tracing, shutdown_tracing
 
 
 logger = logging.getLogger(__name__)
@@ -161,8 +162,11 @@ def build_application(settings: Settings | None = None) -> FastAPI:
                 task.cancel()
             if checkpoint_context is not None:
                 await checkpoint_context.__aexit__(None, None, None)
+            shutdown_tracing()
 
     app = FastAPI(title="Aether Deep Agent Service", version="0.1.0", lifespan=lifespan)
+    configure_tracing()
+    app.add_middleware(OTelMiddleware)
 
     async def authenticated(request: Request) -> None:
         """验证调用方的 HMAC 请求签名。"""

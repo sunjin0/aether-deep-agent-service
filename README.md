@@ -44,6 +44,19 @@ uv run pytest -q
 | `AETHER_DEEP_AGENT_MODEL` | LangChain 模型标识。 |
 | `OPENAI_API_KEY`、`OPENAI_BASE_URL` | OpenAI 兼容模型服务配置。 |
 
+## OpenTelemetry
+
+Trace 和 Log OTLP/HTTP 导出默认关闭。对接 Collector 时显式配置：
+
+```powershell
+$env:AETHER_OTLP_TRACES_ENABLED = "true"
+$env:AETHER_OTLP_TRACES_URL = "http://otel-collector:4318/v1/traces"
+$env:AETHER_OTLP_LOGS_URL = "http://otel-collector:4318/v1/logs"
+$env:OTEL_SERVICE_NAME = "aether-deep-agent-service"
+```
+
+Runtime 会继承入站 `traceparent`，记录 HTTP span，并在服务退出时 flush exporter；不会导出 Prompt、请求体或凭据。
+
 ## Docker
 
 项目自带 `docker-compose.yml`，单独部署时需接入 Java、MCP 和基础设施所在的共享网络：

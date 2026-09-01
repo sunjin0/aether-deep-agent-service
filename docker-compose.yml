@@ -4,6 +4,7 @@ services:
       context: .
     container_name: aether-deep-agent
     restart: unless-stopped
+    stop_grace_period: 30s
     ports:
       - "${AETHER_DEEP_AGENT_PORT:-8010}:8010"
     environment:
@@ -13,6 +14,10 @@ services:
       AETHER_DEEP_AGENT_MODEL: ${AETHER_DEEP_AGENT_MODEL:-openai:gpt-4.1-mini}
       # 独立部署复用 Aether 现有 PostgreSQL 开发账户；生产环境必须通过同名变量覆盖。
       AETHER_DEEP_AGENT_DATABASE_URL: ${AETHER_DEEP_AGENT_DATABASE_URL:-postgresql+asyncpg://sunjin:192837@postgres:5432/aether}
+      AETHER_OTLP_TRACES_ENABLED: ${AETHER_OTLP_TRACES_ENABLED:-false}
+      AETHER_OTLP_TRACES_URL: ${AETHER_OTLP_TRACES_URL:-}
+      AETHER_OTLP_LOGS_URL: ${AETHER_OTLP_LOGS_URL:-}
+      OTEL_SERVICE_NAME: ${AETHER_DEEP_AGENT_OTEL_SERVICE_NAME:-aether-deep-agent-service}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -21,6 +26,7 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health')"]
       interval: 10s
       timeout: 5s
+      start_period: 30s
       retries: 12
     networks:
       aether-services:
